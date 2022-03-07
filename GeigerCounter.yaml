@@ -43,7 +43,7 @@ ota:
 
 
 wifi:
-  #use_address: esphome-web-0ce664.local
+  #use_address: whatevertheheck.local
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
