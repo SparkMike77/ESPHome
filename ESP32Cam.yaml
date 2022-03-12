@@ -1,0 +1,76 @@
+#https://pastebin.com/5DebHtEy
+esphome:
+  name: wide-angle
+  platform: ESP32
+  board: esp32dev
+  
+#esp32:
+#board: esp32cam
+#  framework:
+#    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 0s
+  
+ota:
+  password: "cc6239c30a5b0286efd8a4cea3dedb66"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Wide-Angle Fallback Hotspot"
+    password: "eTChWlJHbvQx"
+
+captive_portal:
+
+web_server:
+  port: 80
+  
+
+
+# ESP32-CAM
+esp32_camera:
+  external_clock:
+    pin: GPIO0
+    frequency: 20MHz
+  i2c_pins:
+    sda: GPIO26
+    scl: GPIO27
+  data_pins: [GPIO5, GPIO18, GPIO19, GPIO21, GPIO36, GPIO39, GPIO34, GPIO35]
+  vsync_pin: GPIO25
+  href_pin: GPIO23
+  pixel_clock_pin: GPIO22
+  power_down_pin: GPIO32
+  resolution: 800x600
+  max_framerate: 8 fps
+  name: PingPongCam
+text_sensor:
+  - platform: version
+    name: "Cam Version"
+switch:
+  - platform: restart
+    name: "Cam Restart"
+binary_sensor:
+  - platform: status
+    name: "Cam Status"
+sensor:
+  - platform: uptime
+    name: Uptime Sensor
+ 
+# Luz
+output:
+  - platform: gpio
+    pin: GPIO4
+    id: gpio_4
+light:
+  - platform: binary
+    output: gpio_4
+    name: wide-angle light
+  
