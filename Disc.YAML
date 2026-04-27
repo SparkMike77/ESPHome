@@ -1,0 +1,204 @@
+substitutions:
+  dev_name: "deepseek-box"
+  friendly_name: "DeepSeek Voice Box"
+  psram_size: 8MB
+
+esphome:
+  name: ${dev_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    # N16R8 (8MB PSRAM)
+    build_flags:
+      - -DBOARD_HAS_PSRAM
+      - -mfix-esp32psram-cache-issue
+    board_build.arduino.memory_type: qio_opi
+
+esp32:
+  # This family of ESP32‑S3‑R8 devkits
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  # For LVGL + 360×360 we need IDF
+  framework:
+    type: esp-idf
+    version: recommended
+  psram:
+    mode: octal
+
+# Logging
+logger:
+  level: DEBUG   # raise to INFO/DEBUG if you need mic / voice logs
+
+# Home Assistant API + OTA
+api:
+  encryption:
+    key: "!secret esphome_api_key"
+
+ota:
+  - platform: esphome
+    password: "!secret esphome_ota_password"
+
+# WiFi
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: ".local"
+
+  # Fallback hotspot
+  ap:
+    ssid: "DeepSeek Voice Box"
+    password: "!secret esphome_ap_password"
+
+captive_portal:
+
+# SPI bus for 1.8" round LCD
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  # MISO is unused for this display
+  # quad mode is not needed here
+  miso_pin: unconnected
+  # 20–40 MHz for GC9A01 / 360×360
+  frequency: 30MHz
+
+# I2S audio codec (ES8311 / similar)
+i2s_audio:
+  - id: i2s_codec
+    i2s_lrclk_pin: GPIO4
+    i2s_bclk_pin: GPIO5
+
+microphone:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_codec
+    adc_type: external
+    i2s_din_pin: GPIO6
+    adc_pins_skip:
+      - 6   # this is the I2S DIN
+    id: mic_in
+    channel: left
+    bits_per_sample: 16bit
+    # full‑range 16‑bit
+    source: 0x10
+    pdm: false
+    sample_rate: 16000   # 16 kHz is enough for voice assistant
+
+speaker:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_codec
+    dac_type: external
+    i2s_dout_pin: GPIO7
+    # 16 kHz or 44.1 kHz; 16 kHz is enough for voice
+    sample_rate: 16000
+    # mono or stereo depending on your board; V2 often uses stereo
+    channel: stereo
+    bits_per_sample: 16bit
+    dac_pins_skip:
+      - 7
+
+# Media player (for TTS / audio from HA)
+media_player:
+  - platform: i2s_audio
+    i2s_audio_id: i2s_codec
+    dac_type: external
+    i2s_dout_pin: GPIO7
+    id: deepseek_speaker
+    name: "DeepSeek Voice Box Speaker"
+    # use 16 kHz if you want power‑savings, 44.1 kHz for better audio
+    sample_rate: 16000
+    mode: mono   # mono is enough for voice assistant
+
+# Voice assistant ↔ Home Assistant Assist
+voice_assistant:
+  microphone: mic_in
+  speaker: speaker_out
+  media_player: deepseek_speaker
+  use_wake_word: false            # handled by HA Assist
+  noise_suppression_level: 2
+  auto_gain: 15dBFS
+  volume_multiplier: 1.5
+  conversation_timeout: 30s
+  on_start_listening:
+    then:
+      - lvgl.set_property:
+          id: main_page
+          property: scr_bg_color
+          value: 0x00AA00    # green hint when listening
+  on_start_conversation:
+    then:
+      - lvgl.set_property:
+          id: main_page
+          property: scr_bg_color
+          value: 0xAAAA00    # yellow when responding
+  on_end:
+    then:
+      - lvgl.set_property:
+          id: main_page
+          property: scr_bg_color
+          value: 0x000000    # back to black
+
+# Micro‑wake‑word (optional; if you want local trigger)
+# micro_wake_word:
+#   models:
+#     - model: hey_jarvis
+#   on_wake_word_detected:
+#     - voice_assistant.start
+
+# 1.8" round GC9A01‑style LCD (360×360)
+display:
+  - platform: strobe_lcd
+    id: display_lcd
+    reset_pin: GPIO18
+    dc_pin: GPIO10
+    cs_pin: GPIO13
+    # backlight PWM
+    backlight_pin: GPIO3
+    # no EXIO / pca for V2; backlight is directly on GPIO3
+    # dimensions as per V2 spec
+    dimensions:
+      width: 360
+      height: 360
+    # controller for this 360×360 display
+    model: GC9A01A
+    # rotation: 0 for upright, 90/180/270 if you see it rotated
+    rotation: 0
+
+# Optional: control the backlight as a light entity
+output:
+  - platform: ledc
+    pin: GPIO3
+    id: bl_pwm
+
+light:
+  - platform: monochromatic
+    output: bl_pwm
+    id: backlight
+    name: "DeepSeek Display Backlight"
+    restore_mode: ALWAYS_ON
+
+# LVGL UI on top of the round display
+lvgl:
+  buffer_size: 25%
+  width: 360
+  height: 360
+
+  pages:
+    - id: main_page
+      bg_color: 0x000000
+      # hide scrollbar
+      styles:
+        - property: lv_style_const.LV_STYLE_SCROLLBAR_MODE
+          value: "LV_SCROLLBAR_MODE_OFF"
+      widgets:
+        - label:
+            id: status_label
+            align: CENTER
+            text: "DeepSeek Box ready"
+            styles:
+              - text_font: Arial_16
+              - text_color: 0xFFFFFF
+
+# Simple font
+font:
+  - file: "gfonts://Arial"
+    id: Arial_16
+    size: 16
