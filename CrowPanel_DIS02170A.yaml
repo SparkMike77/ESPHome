@@ -10,9 +10,9 @@ esphome:
     # Without this the GT911 may not respond and touch stays dead.
     priority: 600
     then:
-      - output.turn_off: gt911_rst
+      - switch.turn_off: gt911_rst
       - delay: 20ms
-      - output.turn_on: gt911_rst
+      - switch.turn_on: gt911_rst
       - delay: 200ms
 
 esp32:
@@ -73,10 +73,11 @@ pca9554:
     address: 0x18
     i2c_id: i2c_bus
 
-output:
+switch:
   # GT911 RST is on PCA9557 pin 2 — pulsed at boot via on_boot above
   - platform: gpio
     id: gt911_rst
+    internal: true
     pin:
       pca9554: io_exp
       number: 2
