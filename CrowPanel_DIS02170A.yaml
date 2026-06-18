@@ -1,0 +1,247 @@
+substitutions:
+  dev_name: "crowpanel-7"
+  friendly_name: "CrowPanel 7\" Display"
+
+esphome:
+  name: ${dev_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: qio
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      # Keep RGB LCD interrupt in IRAM to avoid display tearing
+      CONFIG_LCD_RGB_ISR_IRAM_SAFE: "y"
+  psram:
+    mode: octal     # ESP32-S3-WROOM-1-N16R8 has 8 MB octal-SPI PSRAM
+    speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret esphome_api_key
+
+ota:
+  - platform: esphome
+    password: !secret esphome_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: ".local"
+  ap:
+    ssid: "CrowPanel 7 AP"
+    password: !secret esphome_ap_password
+
+captive_portal:
+
+# ── I2C ──────────────────────────────────────────────────────────────────────
+# GT911 touch controller (Advance V1.3 uses GPIO15/16, NOT 19/20)
+i2c:
+  - id: i2c_bus
+    sda: GPIO15
+    scl: GPIO16
+    frequency: 400kHz
+    scan: true
+
+# ── I2S Audio ─────────────────────────────────────────────────────────────────
+# Speaker: on-board class-D amplifier (I2S output)
+# Mic:     LMD3526B261-OFA01 MEMS I2S microphone (V1.3)
+#
+# ⚠ Speaker pins (GPIO4/5/6) are shared with the SD-card slot.
+#   MIC+SPK and SD card cannot be used at the same time.
+
+i2s_audio:
+  - id: i2s_speaker_bus
+    i2s_lrclk_pin: GPIO6    # speaker WS / LRCLK
+    i2s_bclk_pin: GPIO5     # speaker BCLK
+
+  - id: i2s_mic_bus
+    i2s_lrclk_pin: GPIO2    # mic WS
+    i2s_bclk_pin: GPIO19    # mic CLK
+
+speaker:
+  - platform: i2s_audio
+    id: spk
+    i2s_audio_id: i2s_speaker_bus
+    dac_type: external
+    i2s_dout_pin: GPIO4     # speaker SDIN → amplifier data in
+    channel: mono
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: i2s_mic_bus
+    i2s_din_pin: GPIO20     # mic SD → ESP32 data in
+    adc_type: external
+    pdm: false
+    channel: left
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+# ── Voice Assistant ───────────────────────────────────────────────────────────
+# Tap the "Talk" button on screen (or voice_assistant.start from any automation)
+# Requires Home Assistant with a configured Assist voice pipeline.
+# To enable local wake-word, uncomment the micro_wake_word block below.
+voice_assistant:
+  microphone: mic
+  speaker: spk
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 15dBFS
+  volume_multiplier: 2.0
+  on_listening:
+    then:
+      - lvgl.label.update:
+          id: lbl_status
+          text: "Listening..."
+  on_tts_start:
+    then:
+      - lvgl.label.update:
+          id: lbl_status
+          text: "Speaking..."
+  on_end:
+    then:
+      - lvgl.label.update:
+          id: lbl_status
+          text: "Ready"
+  on_error:
+    then:
+      - lvgl.label.update:
+          id: lbl_status
+          text: "Error - tap to retry"
+
+# Optional local wake-word (ESP32-S3 supports this in ESPHome):
+# micro_wake_word:
+#   models:
+#     - model: hey_jarvis
+#   on_wake_word_detected:
+#     - voice_assistant.start:
+
+# ── Display ───────────────────────────────────────────────────────────────────
+# DIS02170A Advance V1.3 — 7.0" IPS 800×480 RGB565 16-bit parallel
+# Backlight is managed automatically by the on-board STC8H1K28 MCU (no GPIO).
+#
+# ⚠ SC7277 display driver requires SPI initialisation (via GPIO39/41/42) before
+#   it accepts RGB data. Without it the screen stays blank. ESPHome does not yet
+#   have a native SC7277 driver, so add an on_boot lambda with the init sequence.
+#   See: https://forum.elecrow.com/discussion/28231
+#   and: https://github.com/esphome/feature-requests/issues/3034
+
+display:
+  - platform: rpi_dpi_rgb
+    id: main_display
+    auto_clear_enabled: false
+    dimensions:
+      width: 800
+      height: 480
+    de_pin:
+      number: GPIO42
+      inverted: false
+    hsync_pin:
+      number: GPIO40
+      inverted: false
+    vsync_pin:
+      number: GPIO41
+      inverted: false
+    pclk_pin: GPIO39
+    pclk_frequency: 16MHz
+    pclk_inverted: false
+    # Horizontal timing
+    hsync_pulse_width: 30
+    hsync_back_porch: 16
+    hsync_front_porch: 10
+    # Vertical timing
+    vsync_pulse_width: 13
+    vsync_back_porch: 10
+    vsync_front_porch: 10
+    # 16-bit RGB565 data pins (MSB → LSB per channel) — Advance V1.3 pinout
+    data_pins:
+      red:
+        - GPIO46   # R4 (MSB)
+        - GPIO3    # R3
+        - GPIO18   # R2
+        - GPIO17   # R1
+        - GPIO7    # R0 (LSB)
+      green:
+        - GPIO14   # G5 (MSB)
+        - GPIO13   # G4
+        - GPIO12   # G3
+        - GPIO11   # G2
+        - GPIO10   # G1
+        - GPIO9    # G0 (LSB)
+      blue:
+        - GPIO38   # B4 (MSB)
+        - GPIO45   # B3
+        - GPIO48   # B2
+        - GPIO47   # B1
+        - GPIO21   # B0 (LSB)
+
+# ── Touch ─────────────────────────────────────────────────────────────────────
+# GT911 INT routes through the STC8H1K28 MCU — polling is used instead
+touchscreen:
+  - platform: gt911
+    id: touch
+    display: main_display
+    i2c_id: i2c_bus
+    address: 0x5D
+    update_interval: 16ms
+
+# ── Fonts ─────────────────────────────────────────────────────────────────────
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_roboto_24
+    size: 24
+  - file: "gfonts://Roboto"
+    id: font_roboto_16
+    size: 16
+
+# ── LVGL ─────────────────────────────────────────────────────────────────────
+
+lvgl:
+  display_id: main_display
+  touchscreens:
+    - touch
+  buffer_size: 25%
+  pages:
+    - id: main_page
+      bg_color: 0x1A1A2E
+      widgets:
+        - label:
+            id: lbl_status
+            align: CENTER
+            text: "Ready"
+            text_font: font_roboto_24
+            text_color: 0xFFFFFF
+        # Tap to start a voice assistant session
+        - button:
+            id: btn_listen
+            align: BOTTOM_MID
+            y: -30
+            width: 220
+            height: 70
+            bg_color: 0x0055AA
+            on_click:
+              then:
+                - voice_assistant.start:
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "  Talk to Assist"
+                  text_font: font_roboto_24
+                  text_color: 0xFFFFFF
