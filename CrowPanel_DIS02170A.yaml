@@ -5,6 +5,15 @@ esphome:
     build_flags: "-DBOARD_HAS_PSRAM"
     board_build.esp-idf.memory_type: qio_opi
     board_build.flash_mode: dio
+  on_boot:
+    # Pulse GT911 RST via PCA9557 pin 2 before the touchscreen driver inits.
+    # Without this the GT911 may not respond and touch stays dead.
+    priority: 600
+    then:
+      - output.turn_off: gt911_rst
+      - delay: 20ms
+      - output.turn_on: gt911_rst
+      - delay: 200ms
 
 esp32:
   variant: esp32s3
@@ -54,7 +63,26 @@ i2c:
     sda: GPIO15
     scl: GPIO16
     frequency: 400kHz
-    scan: true
+    scan: false    # scan: true can disturb GT911 initialisation
+
+# ── IO Expander ───────────────────────────────────────────────────────────────
+# PCA9557 at 0x18 — compatible with ESPHome's pca9554 component.
+# Controls GT911 RST (pin 2), backlight, and audio amp enable.
+pca9554:
+  - id: io_exp
+    address: 0x18
+    i2c_id: i2c_bus
+
+output:
+  # GT911 RST is on PCA9557 pin 2 — pulsed at boot via on_boot above
+  - platform: gpio
+    id: gt911_rst
+    pin:
+      pca9554: io_exp
+      number: 2
+      mode:
+        output: true
+      inverted: false
 
 # ── I2S Audio ─────────────────────────────────────────────────────────────────
 # Speaker: on-board class-D amplifier (I2S output)
@@ -198,7 +226,7 @@ touchscreen:
     id: touch
     display: main_display
     i2c_id: i2c_bus
-    address: 0x5D
+    address: 0x5D    # if touch still dead after flashing, try 0x14
     update_interval: 16ms
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
