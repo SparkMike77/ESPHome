@@ -1,0 +1,189 @@
+################################################################################
+# Scanner — MLX90640 Thermal Camera on LILYGO TTGO T-Display
+#
+# Hardware:
+#   LILYGO TTGO T-Display (ESP32 + ST7789V 240×135 TFT)
+#   Melexis MLX90640 breakout  →  VDD=3.3V  GND  SDA=GPIO21  SCL=GPIO22
+#
+# Build & flash:
+#   esphome run Scanner.yaml               # first flash via USB
+#   esphome compile Scanner.yaml           # OTA subsequent updates
+################################################################################
+
+esphome:
+  name: scanner
+  friendly_name: Thermal Scanner
+  # Make the component header visible to the display lambda
+  includes:
+    - components/mlx90640_display/mlx90640_display.h
+  on_boot:
+    priority: 600
+    then:
+      - output.turn_on: backlight
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [mlx90640_display]
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Scanner Fallback"
+    password: "thermalcam"
+
+captive_portal:
+
+################################################################################
+# SPI bus — ST7789V display (TTGO T-Display default pins)
+################################################################################
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+################################################################################
+# Backlight (GPIO4, active-high)
+################################################################################
+output:
+  - platform: gpio
+    pin: GPIO4
+    id: backlight
+
+################################################################################
+# Fonts  (downloaded from Google Fonts at compile time)
+################################################################################
+font:
+  - file: "gfonts://Roboto"
+    id: font_title
+    size: 13
+    glyphs: "THERMALSCNWIFBDKPU0123456789 .:"
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+    glyphs: "MINAXSCLEWFBDKPUmaxinsclewfbdkpu0123456789 .°%:-+"
+
+################################################################################
+# MLX90640 thermal sensor component
+#
+# refresh_rate register:
+#   0x00=0.5Hz  0x01=1Hz  0x02=2Hz  0x03=4Hz
+#   0x04=8Hz    0x05=16Hz 0x06=32Hz 0x07=64Hz
+################################################################################
+mlx90640_display:
+  id: thermal_cam
+  mintemp: 15.0        # colour scale lower bound °C
+  maxtemp: 40.0        # colour scale upper bound °C
+  refresh_rate: 0x04   # 8 Hz
+  update_interval: 200ms
+
+################################################################################
+# Optional: expose min/max temps to Home Assistant
+# Uncomment to enable:
+#
+# sensor:
+#   - platform: mlx90640_display
+#     mlx90640_id: thermal_cam
+#     min_temperature:
+#       name: "Thermal Min Temp"
+#     max_temperature:
+#       name: "Thermal Max Temp"
+################################################################################
+
+################################################################################
+# WiFi signal sensor (displayed in sidebar)
+################################################################################
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_db
+    update_interval: 10s
+
+################################################################################
+# ST7789V display — TTGO T-Display pinout
+#
+# If the image appears offset or clipped, add:
+#   offset_x: 40
+#   offset_y: 53
+# (needed on some hardware revisions)
+################################################################################
+display:
+  - platform: ili9xxx
+    model: ST7789V
+    cs_pin: GPIO5
+    dc_pin: GPIO16
+    reset_pin: GPIO23
+    width: 240
+    height: 135
+    # offset_x: 40
+    # offset_y: 53
+    update_interval: 150ms
+    lambda: |-
+      // ── Layout constants ──────────────────────────────────────────────────
+      static const int SCALE      = 4;           // pixels per thermal pixel
+      static const int TOP_MARGIN = 19;          // (135 - 24*SCALE) / 2 = 19.5 → 19
+      static const int IMG_W      = 32 * SCALE;  // 128
+      static const int BAR_X      = IMG_W;       // 128  — colour scale bar
+      static const int BAR_W      = 4;
+      static const int SB_X       = BAR_X + BAR_W; // 132 — sidebar
+
+      it.fill(Color::BLACK);
+
+      if (!id(thermal_cam)->is_ready()) {
+        it.printf(20, 57, id(font_title), Color(255, 200, 0), "Warming up...");
+        return;
+      }
+
+      const float *frame = id(thermal_cam)->get_frame();
+      float t_min = id(thermal_cam)->get_mintemp();
+      float t_max = id(thermal_cam)->get_maxtemp();
+
+      // ── Thermal image (mirrored L/R so it acts like a mirror) ────────────
+      for (int row = 0; row < 24; row++) {
+        for (int col = 0; col < 32; col++) {
+          float temp = frame[row * 32 + col];
+          Color c = id(thermal_cam)->temp_to_color(temp, t_min, t_max);
+          int draw_col = 31 - col;   // horizontal mirror
+          it.filled_rectangle(draw_col * SCALE,
+                              TOP_MARGIN + row * SCALE,
+                              SCALE, SCALE, c);
+        }
+      }
+
+      // ── Colour scale bar (vertical gradient, full height) ────────────────
+      for (int y = 0; y < 135; y++) {
+        float norm = 1.0f - static_cast<float>(y) / 134.0f;
+        float temp = t_min + norm * (t_max - t_min);
+        Color c = id(thermal_cam)->temp_to_color(temp, t_min, t_max);
+        it.filled_rectangle(BAR_X, y, BAR_W, 1, c);
+      }
+
+      // ── Sidebar ──────────────────────────────────────────────────────────
+      it.printf(SB_X + 4,  8, id(font_title), Color(255, 200,   0), "THERMAL");
+      it.printf(SB_X + 4, 32, id(font_small), Color(255, 255, 255), "MIN %.1f C",
+                id(thermal_cam)->get_min_detected());
+      it.printf(SB_X + 4, 50, id(font_small), Color(255, 255, 255), "MAX %.1f C",
+                id(thermal_cam)->get_max_detected());
+      it.printf(SB_X + 4, 68, id(font_small), Color(180, 180, 180), "SCALE %.0f-%.0f",
+                t_min, t_max);
+      if (!isnan(id(wifi_signal_db).state)) {
+        it.printf(SB_X + 4, 90, id(font_small), Color(100, 200, 255), "WiFi %ddBm",
+                  static_cast<int>(id(wifi_signal_db).state));
+      }
