@@ -13,9 +13,6 @@
 esphome:
   name: scanner
   friendly_name: Thermal Scanner
-  # Make the component header visible to the display lambda
-  includes:
-    - components/mlx90640_display/mlx90640_display.h
   on_boot:
     priority: 600
     then:
@@ -119,10 +116,8 @@ sensor:
 ################################################################################
 # ST7789V display — TTGO T-Display pinout
 #
-# If the image appears offset or clipped, add:
-#   offset_x: 40
-#   offset_y: 53
-# (needed on some hardware revisions)
+# If the image appears offset or clipped, add offset_width/offset_height
+# under dimensions (some hardware revisions need offset_width: 40, offset_height: 53)
 ################################################################################
 display:
   - platform: ili9xxx
@@ -130,10 +125,11 @@ display:
     cs_pin: GPIO5
     dc_pin: GPIO16
     reset_pin: GPIO23
-    width: 240
-    height: 135
-    # offset_x: 40
-    # offset_y: 53
+    dimensions:
+      width: 240
+      height: 135
+      # offset_width: 40
+      # offset_height: 53
     update_interval: 150ms
     lambda: |-
       // ── Layout constants ──────────────────────────────────────────────────
