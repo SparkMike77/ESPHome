@@ -3,18 +3,14 @@
 #include "esphome/core/component.h"
 #include "esphome/core/color.h"
 #include "esphome/components/sensor/sensor.h"
-
-// Forward-declare so the header stays Arduino-free.
-// Wire.h and Adafruit_MLX90640.h are included only in the .cpp.
-class Adafruit_MLX90640;
+#include "mlx90640_api.h"
 
 namespace esphome {
 namespace mlx90640 {
 
 class MLX90640Component : public PollingComponent {
  public:
-  MLX90640Component();
-  ~MLX90640Component();
+  MLX90640Component() : PollingComponent(200) {}
 
   void set_mintemp(float t) { mintemp_ = t; }
   void set_maxtemp(float t) { maxtemp_ = t; }
@@ -32,18 +28,21 @@ class MLX90640Component : public PollingComponent {
   void setup() override;
   void update() override;
 
-  // Iron palette: black → blue → cyan → yellow → red
   static Color temp_to_color(float temp, float t_min, float t_max);
 
  protected:
-  Adafruit_MLX90640 *mlx_{nullptr};
-  float frame_[768]{};
-  float mintemp_{15.0f};
-  float maxtemp_{40.0f};
-  uint8_t refresh_rate_{0x04};
-  float min_detected_{0.0f};
-  float max_detected_{100.0f};
-  bool ready_{false};
+  paramsMLX90640 params_{};
+  uint16_t       eeData_[MLX90640_EEPROM_WORDS]{};
+  uint16_t       frameData_[MLX90640_FRAME_WORDS]{};
+  float          frame_[768]{};
+
+  float    mintemp_{15.0f};
+  float    maxtemp_{40.0f};
+  uint8_t  refresh_rate_{0x04};
+  float    min_detected_{0.0f};
+  float    max_detected_{100.0f};
+  bool     ready_{false};
+
   sensor::Sensor *min_temp_sensor_{nullptr};
   sensor::Sensor *max_temp_sensor_{nullptr};
 };

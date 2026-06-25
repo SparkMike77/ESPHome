@@ -39,5 +39,6 @@ async def to_code(config):
     cg.add(var.set_maxtemp(config[CONF_MAXTEMP]))
     cg.add(var.set_refresh_rate(config[CONF_REFRESH_RATE]))
 
-    cg.add_library("Adafruit MLX90640", None)
-    cg.add_library("Adafruit BusIO", None)
+    # No external library dependencies — all driver code is bundled in the
+    # component directory and compiled as component source, so Wire.h is
+    # always visible (unlike PlatformIO's .piolibdeps compilation context).

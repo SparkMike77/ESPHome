@@ -1,21 +1,237 @@
+# CrowPanel DIS02170A Advance V1.3 — ESP32-S3, 800x480, SC7277 display, GT911 touch
+#
+# ============================================================
+# KNOWN I2C DEVICES ON BUS (sda=15, scl=16):
+#   0x30 — STC8H1K28 backlight MCU AND GT911 RST controller.
+#          Send {0x10} to init backlight AND release GT911 RST (via internal pin P1.7).
+#          Brightness: 0x00=max, 0xF5=off. Init MUST happen before GT911 driver runs.
+#   0x51 — PCF8563 RTC (real-time clock). NOT an IO expander. Do not write config bytes.
+#          (0x18 IO expander does not exist on V1.3 — removed vs V1.0, replaced by STC8H1K28)
+#   0x5D — GT911 touch. Elecrow official address. ESPHome gt911 primary address.
+#          If GT911 appears at 0x14 in scan, the driver falls back automatically.
+# ============================================================
+#
+# ============================================================
+# TOUCH (GT911) — INVESTIGATION LOG
+# ============================================================
+# SYMPTOM: No touch events logged; GT911 marked FAILED at boot.
+#
+# ATTEMPT 1 — Used address 0x5D, no calibration block.
+#   RESULT: "Calibration error" — ESPHome reads x_raw_max from GT911;
+#           GT911 NACKed the read. ESPHome then marks FAILED.
+#
+# ATTEMPT 2 — Added calibration: x_min/x_max/y_min/y_max.
+#   WHY: Setting x_raw_max_ nonzero bypasses the register read in ESPHome
+#        gt911 driver, skipping the "Calibration error" path.
+#   RESULT: Error changed to "Communication failed" — the initial
+#           write(GET_SWITCHES) to GT911 NACKs. GT911 not on bus at all.
+#
+# ATTEMPT 3 — Tried address 0x14 directly (instead of 0x5D).
+#   WHY: ESPHome driver tries 0x5D then falls back to 0x14 anyway;
+#        factory code drives INT low during RST so address IS 0x14.
+#   RESULT: Still "Communication failed". Address not the root cause.
+#
+# ATTEMPT 4 — Added RST pulse via TCA9534 at 0x18, priority 600.
+#   WHY: Makerguides tutorial for this exact board shows TCA9534.output(2)
+#        controls GT911 RST. Default TCA9534 pins are input (high-impedance);
+#        external pull-down holds RST low → GT911 stuck in reset forever.
+#   RESULT: GT911 still failing. AHT20 also failed (later found: AHT20 disconnected).
+#           "TCA9534 cfg:" log line was ABSENT from boot log entirely.
+#   ROOT CAUSE IDENTIFIED: at priority 600, the on_boot lambda is registered
+#           before the i2c component (esphome: block comes first in YAML, so
+#           its triggers are registered first). Same-priority components run in
+#           registration order — so on_boot fires BEFORE I2C is initialized.
+#           Writing to uninitialized I2C hardware leaves bus in bad state.
+#           Boot log confirmed: "Recovery: bus successfully recovered" = bus was
+#           corrupted on previous boot by our premature I2C writes.
+#
+# ATTEMPT 5 — Changed on_boot priority from 600 to 500.
+#   WHY: I2C bus uses setup_priority::BUS = 600. Sensors/touch use
+#        setup_priority::DATA = 400. Priority 500 slots between them,
+#        guaranteeing I2C is ready AND GT911 hasn't initialized yet.
+#   RESULT: GT911 still "Communication failed". (AHT20 failures irrelevant — disconnected.)
+#           "TCA9534 cfg:" log message STILL absent — 768-byte log buffer
+#           fills with [C] config dump, overwriting all on_boot messages.
+#           Cannot determine if TCA9534 ACKed or NACKed from log alone.
+#           "Recovery: bus successfully recovered" still appears on every boot.
+#
+# ATTEMPT 6 — Add GPIO1 (INT) control, fix TCA9534 output register, add I2C
+#             scan as HA text sensor for post-connection diagnostics.
+#   WHY:
+#     a) Factory initGT911() drives GPIO1 LOW BEFORE the RST pulse. Without
+#        this, GT911's INT pin is floating; address selection is undefined
+#        and GT911 may fail to properly initialize.
+#     b) Previous output register write {0x01, 0x00} drove ALL TCA9534 pins
+#        low including pin 1 (backlight); correct is {0x01, 0x02} = pin1 HIGH
+#        (backlight), pin2 LOW (RST). Config reg changed to 0xF9 (pins 1+2 out).
+#     c) Log buffer (768B) is too small to capture on_boot messages before
+#        API connects. Using a text_sensor in HA to expose I2C scan results
+#        that are visible after connection regardless of log buffer.
+#   RESULT: I2C scan showed "30 51" — 0x51 newly appeared, GT911 still absent.
+#           0x18 was never on the bus; those writes NACKed silently → GT911 RST
+#           was NEVER actually released. 0x51 is the IO expander candidate.
+#
+# ATTEMPT 7 — Update RST sequence to use IO expander at 0x51 (found by scan).
+#   WHY: I2C scan confirmed 0x51 is present; 0x18 was never there.
+#   RESULT: Scan STILL showed "30 51" only — GT911 did not appear. 0x51 is NOT an
+#           IO expander. Writes to 0x51 were corrupting a PCF8563 RTC (harmlessly).
+#
+# WHAT IS KNOWN (from official Elecrow GitHub for DIS02170A V1.3):
+#   - GT911 SDA=GPIO15, SCL=GPIO16 (confirmed)
+#   - GT911 INT = GPIO1 (but NOT driven by ESP32 for address selection — INT floats)
+#   - GT911 address = 0x5D (Elecrow official code confirms: #define TOUCH_GT911_ADDR 0x5D)
+#   - GT911 RST wired to STC8H1K28 pin P1.7 — NOT any IO expander, NOT any ESP32 GPIO
+#   - PCA9557 IO expander was on V1.0 only; REMOVED in V1.2/V1.3, replaced by STC8H1K28
+#   - STC8H1K28 at 0x30: send {0x10} to init backlight AND release GT911 RST
+#   - 0x51 = PCF8563 RTC, unrelated to touch
+#
+# ESPHome gt911 driver (gt911_touchscreen.cpp) behavior — confirmed from source:
+#   - PRIMARY_ADDRESS = 0x5D, SECONDARY_ADDRESS = 0x14
+#   - If configured to 0x5D and initial write fails → auto-falls back to 0x14
+#   - Fallback ONLY works when configured to PRIMARY (0x5D); configuring 0x14 disables it
+#   - "Calibration error" fires when x_raw_max_ == 0 AND register read fails
+#   - "Communication failed" fires when x_raw_max_ != 0 AND initial write fails
+#   - calibration: block sets x_raw_max_ → bypasses register read entirely
+#
+# ATTEMPT 8 — Send {0x10} to STC8H1K28 FIRST in on_boot, add 200ms delay, use 0x5D,
+#             NO calibration block.
+#   WHY: {0x10} releases GT911 RST. Sending it first gives GT911 200ms before scan.
+#   RESULT: Progress — error changed to "Calibration error" (GT911 IS on the bus!).
+#           Boot log showed Address: 0x14 — driver tried 0x5D (failed), fell back to 0x14
+#           and connected. x_raw_max_ was 0 (no calibration block) → register read attempted
+#           → failed → "Calibration error". I2C scan "30 51" — GT911 not ready for address
+#           probe at 200ms but IS ready for GET_SWITCHES at ~400ms when driver ran.
+#
+# ATTEMPT 9 — Increase delay to 500ms, change address to 0x14, no calibration block.
+#   WHY: GT911 found at 0x14 (via fallback); 500ms delay means driver runs at ~700ms.
+#   RESULT: I2C scan STILL "30 51". "Calibration error" again — x_raw_max_ still 0,
+#           GT911 ACKed GET_SWITCHES at ~700ms but GET_MAX_VALUES register read failed.
+#           GT911 responds to initial writes but register reads still fail at 700ms.
+#
+# ATTEMPT 10 — Increase delay to 1000ms, ADD calibration block (x_raw_max_=800).
+#   WHY: bypass register read entirely; give GT911 1000ms to fully initialize.
+#        1000ms delay → driver runs at ~1700ms from RST release.
+#   RESULT: "Communication failed" — GT911 stops responding by ~1700ms (enters sleep
+#           or STC8H1K28 re-asserts RST). Window closes between ~800ms and ~1700ms.
+#           x_raw_max_=800 confirmed working (no "Calibration error"), but GT911 gone.
+#
+# ATTEMPT 11 — address: 0x5D (enables fallback), delay: 500ms, calibration block kept.
+#   WHY: - Elecrow official code confirms GT911 address = 0x5D on this board
+#        - ESPHome gt911 auto-fallback (0x5D→0x14) only works when configured to 0x5D
+#        - Previous 500ms delay had GT911 responding at driver time (~700ms from RST)
+#        - Calibration block (x_raw_max_=800) bypasses register read entirely
+#        - This is the first attempt combining: correct address + calibration bypass +
+#          timing known to have GT911 on bus
+#   RESULT: PENDING
+# ============================================================
+#
+# ============================================================
+# THINGS THAT MUST NOT CHANGE — DOCUMENTED FAILURES
+# ============================================================
+# 1. wifi: DO NOT add manual_ip / static IP of any kind.
+#    REASON: Network is NOT 192.168.x.x. Adding 192.168.x.x IP broke OTA
+#    on a working device and required USB reflash to recover.
+#
+# 2. i2c scan: false — DO NOT change to scan: true.
+#    REASON: scan: true causes screen to go black and device to go offline.
+#    I2C scan with these devices locks up the bus entirely.
+#
+# 3. lvgl displays: main_display — DO NOT change to display_id: or a list.
+#    REASON: display_id: key does not work in this ESPHome version; confirmed
+#    broken. Scalar form "displays: main_display" is the only working syntax.
+#
+# 4. display data_pins — DO NOT reorder or change GPIO numbers.
+#    REASON: This exact pin assignment (R:7,17,18,3,46 G:9-14 B:21,47,48,45,38)
+#    produces a correct working image. Any change breaks the display.
+#
+# 5. display color_order: RGB, invert_colors: true — DO NOT change either.
+#    REASON: These were tuned to fix color/inversion. Changing either
+#    produces wrong colors or inverted image.
+#
+# 6. touchscreen calibration block — DO NOT remove.
+#    REASON: Without it, ESPHome tries to read max values from GT911 registers;
+#    GT911 NACKs, producing "Calibration error" and marking component FAILED.
+#
+# 7. GPIO 19, 20 — DO NOT assign to any component (I2S mic, second I2C, etc.)
+#    REASON: GPIO19/20 are ESP32-S3 USB D-/D+ (Serial/JTAG). Assigning them
+#    kills serial log output entirely. Mic on I2S using GPIO19/20 was tried
+#    and caused complete loss of serial debugging.
+#
+# 8. framework: type: esp-idf + psram octal 80MHz + platformio_options —
+#    DO NOT change. This combination is required for PSRAM to work. Wrong
+#    settings cause boot failures or PSRAM not being available.
+#
+# 9. on_boot priority: 500 — DO NOT raise back to 600.
+#    REASON: At priority 600 the lambda fires before I2C is initialized (same
+#    priority = registration order wins; esphome: block registers before i2c:).
+#    Writing to uninitialized I2C corrupts the bus state. Priority 500 slots
+#    between I2C (600) and sensors/touch (400).
+#
+# 10. GPIO1 — DO NOT drive as output or assign to any component.
+#     REASON: GPIO1 is GT911 INT. Elecrow official code confirms GT911 address = 0x5D
+#     (INT floats low during RST release → address 0x5D per GT911 spec).
+#     Driving GPIO1 explicitly (as tried in ATTEMPTS 6-7) adds timing risk and
+#     should not be done — let the hardware handle address selection naturally.
+#
+# 11. 0x51 (PCF8563 RTC) — DO NOT write I2C config/output bytes to this address.
+#     REASON: 0x51 is a PCF8563 RTC, not an IO expander. Writing TCA9534-style
+#     config register bytes to it silently corrupts RTC alarm/time registers.
+# ============================================================
+
 esphome:
   name: crowpanel
   friendly_name: Crowpanel
+  # !! DO NOT CHANGE: PSRAM requires these exact platformio settings !!
   platformio_options:
     build_flags: "-DBOARD_HAS_PSRAM"
     board_build.esp-idf.memory_type: qio_opi
     board_build.flash_mode: dio
   on_boot:
-    priority: 600.0
+    # Priority 500: deliberately between I2C bus (priority 600, BUS) and sensors/touch
+    # (priority 400, DATA). Guarantees I2C is ready AND our RST release completes
+    # before GT911 setup() runs.
+    #
+    # !! DO NOT raise back to 600 !!
+    # At priority 600 this lambda fires before I2C is initialized → bus corruption.
+    # See ATTEMPT 4 / ATTEMPT 9 in investigation log above.
+    priority: 500.0
     then:
       - lambda: |-
-          uint8_t cmd[1] = { 0x10 };
-          id(bus_a).write(0x30, cmd, 1);
-      - switch.turn_off: gt911_rst
-      - delay: 20ms
-      - switch.turn_on: gt911_rst
-      - delay: 200ms
+          delay(50);  // Allow I2C devices to stabilize after bus init
 
+          // --- STC8H1K28 init FIRST (V1.3 hardware: STC8H1K28 controls GT911 RST) ---
+          // On V1.3, GT911 RST is wired to STC8H1K28 pin P1.7 — NOT to any IO expander
+          // and NOT to any direct ESP32-S3 GPIO. The STC8H1K28 firmware releases GT911
+          // RST when it receives the {0x10} init command.
+          // !! Must be sent BEFORE the scan so GT911 has 200ms to initialize !!
+          // Sending {0x10} after the scan (as in ATTEMPT 7) left GT911 in reset
+          // during the scan, then the GT911 driver at priority 400 ran within a few
+          // ms of RST release — too fast; GT911 needs ≥100ms after RST → NACK.
+          uint8_t bl_cmd[1] = {0x10};
+          id(bus_a).write(0x30, bl_cmd, 1);
+          delay(500);   // GT911 responds to GET_SWITCHES at ~700ms from RST (confirmed
+                        // ATTEMPTS 8-9). 500ms delay → driver runs at ~700ms → in window.
+                        // Do NOT increase to 1000ms — GT911 stops responding by ~1700ms.
+
+          // --- Full I2C scan (post-RST) using ESPHome write probe ---
+          // ESP-IDF 5.5.4 removed the legacy I2C API (i2c_cmd_handle_t etc.).
+          // ESPHome's write(addr, data, 0) issues START+address+STOP and returns
+          // ERROR_OK only when the address byte ACKs.
+          // Expected: 14 (GT911), 30 (STC8H1K28), 51 (PCF8563 RTC)
+          std::string i2c_found = "";
+          uint8_t probe_dummy = 0;
+          for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+              auto err = id(bus_a).write(addr, &probe_dummy, 0);
+              if (err == i2c::ERROR_OK) {
+                  char buf[8];
+                  snprintf(buf, sizeof(buf), "%02X ", addr);
+                  i2c_found += buf;
+              }
+          }
+          if (i2c_found.empty()) i2c_found = "none";
+          id(i2c_scan).publish_state(i2c_found);
+
+# !! DO NOT CHANGE: framework + sdkconfig required for PSRAM and stability !!
 esp32:
   board: esp32-s3-devkitc-1
   framework:
@@ -26,6 +242,7 @@ esp32:
       CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
       CONFIG_SPIRAM_RODATA: y
 
+# !! DO NOT CHANGE: octal mode + 80MHz required for PSRAM on this board !!
 psram:
   mode: octal
   speed: 80MHz
@@ -40,6 +257,8 @@ ota:
   - platform: esphome
     password: "b2c1b5b206a36559468ec73281b6fa37"
 
+# !! DO NOT ADD manual_ip or any static IP — network is NOT 192.168.x.x !!
+# !! Adding a static IP WILL break OTA and require USB reflash to recover !!
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
@@ -74,38 +293,31 @@ image:
     resize: 200x200
     type: RGB565
 
+# !! DO NOT CHANGE: sda/scl confirmed correct from Elecrow factory code !!
+# !! DO NOT change scan to true — it locks up the I2C bus and crashes the device !!
 i2c:
   sda: 15
   scl: 16
   scan: false
   id: bus_a
 
-pca9554:
-  - id: io_exp
-    address: 0x18
-    i2c_id: bus_a
-
-sensor:
-  - platform: aht10
-    variant: AHT20
-    temperature:
-      name: "Room Temperature"
-      id: room_temp
-      unit_of_measurement: "°C"
-      accuracy_decimals: 1
-    humidity:
-      name: "Room Humidity"
-      id: room_hum
-      unit_of_measurement: "%"
-      accuracy_decimals: 1
-    update_interval: 1s
-
+# GT911 touch — address 0x5D (Elecrow official, ESPHome gt911 PRIMARY_ADDRESS).
+#   ESPHome driver auto-falls back 0x5D→0x14 if 0x5D fails; fallback ONLY works from 0x5D.
+#   Configuring 0x14 directly disables the fallback mechanism.
+# !! DO NOT REMOVE calibration block — it sets x_raw_max_=800 which bypasses the
+#   GET_MAX_VALUES register read (which fails for unknown reasons on this board). !!
+# !! DO NOT change address to 0x14 — loses auto-fallback. Use 0x5D for both addresses. !!
 touchscreen:
   - platform: gt911
     id: touch
     i2c_id: bus_a
-    address: 0x14
+    address: 0x5D
     update_interval: 16ms
+    calibration:
+      x_min: 0
+      x_max: 800
+      y_min: 0
+      y_max: 480
     on_touch:
       then:
         - logger.log:
@@ -113,6 +325,11 @@ touchscreen:
             format: "Touch: x=%d y=%d"
             args: [touch.x, touch.y]
 
+# !! DO NOT CHANGE any display settings — this exact config produces a working image !!
+# color_order: RGB + invert_colors: true — tuned values; changing either breaks colors.
+# data_pins order matters — these LSB-first pin assignments are correct for SC7277 driver.
+# pclk_frequency: 20MHz + timing values (4/8/8) — confirmed stable.
+# !! DO NOT add GPIO38 to interrupt_pin on GT911 — it is used here as blue[4] (B MSB) !!
 display:
   - platform: rpi_dpi_rgb
     id: main_display
@@ -136,29 +353,43 @@ display:
     vsync_back_porch: 8
     data_pins:
       red:
-        - 7
-        - 17
-        - 18
-        - 3
-        - 46
+        - 7    # R0 (LSB)
+        - 17   # R1
+        - 18   # R2
+        - 3    # R3
+        - 46   # R4 (MSB)
       green:
-        - 9
-        - 10
-        - 11
-        - 12
-        - 13
-        - 14
+        - 9    # G0 (LSB)
+        - 10   # G1
+        - 11   # G2
+        - 12   # G3
+        - 13   # G4
+        - 14   # G5 (MSB)
       blue:
-        - 21
-        - 47
-        - 48
-        - 45
-        - 38
+        - 21   # B0 (LSB)
+        - 47   # B1
+        - 48   # B2
+        - 45   # B3
+        - 38   # B4 (MSB) — DO NOT use GPIO38 as GT911 interrupt_pin
 
 time:
   - platform: homeassistant
     id: time_comp
 
+# Diagnostic: full I2C scan (0x08-0x77) published from on_boot, visible in HA after connection.
+# Scan runs 500ms after {0x10} (RST release). GT911 initializes AFTER the scan window —
+# scan consistently shows "30 51" even when GT911 responds to the driver 200ms later.
+# Known devices: 0x30=STC8H1K28 (always), 0x51=PCF8563 RTC (always).
+# GT911 (0x5D or 0x14) does NOT appear in scan — it only responds after the scan window.
+# ESP-IDF 5.5.4 removed legacy I2C API; using ESPHome write(addr, &dummy, 0) probe.
+text_sensor:
+  - platform: template
+    name: "I2C Scan"
+    id: i2c_scan
+    update_interval: never
+
+# !! DO NOT CHANGE: use "displays: main_display" (scalar). !!
+# !! DO NOT use "display_id:" — it fails. DO NOT change to a list form. !!
 lvgl:
   log_level: INFO
   color_depth: 16
@@ -203,36 +434,10 @@ lvgl:
         y: 350
         text: "OFF"
 
-interval:
-  - interval: 5s
-    then:
-      - lambda: |-
-          uint8_t buf[1] = {0};
-          auto err5d = id(bus_a).read(0x5D, buf, 1);
-          auto err14 = id(bus_a).read(0x14, buf, 1);
-          auto err18 = id(bus_a).read(0x18, buf, 1);
-          ESP_LOGI("i2c_probe", "0x5D=%d  0x14=%d  0x18=%d (0=OK)", err5d, err14, err18);
-  - interval: 1s
-    then:
-      - lambda: |-
-          char temp_str[20];
-          char hum_str[20];
-          snprintf(temp_str, sizeof(temp_str), "Temp: %.1f°C", id(room_temp).state);
-          snprintf(hum_str, sizeof(hum_str), "Humi: %.1f%%", id(room_hum).state);
-          lv_label_set_text(id(label_temp), temp_str);
-          lv_label_set_text(id(label_hum), hum_str);
 
+# Backlight control via STC8H1K28 MCU at I2C 0x30.
+# Value range: 0x00 = max brightness, 0xF5 (245) = off.
 switch:
-  - platform: gpio
-    id: gt911_rst
-    internal: true
-    pin:
-      pca9554: io_exp
-      number: 2
-      mode:
-        output: true
-      inverted: false
-
   - platform: template
     name: "Backlight Max (0)"
     id: bl_max
