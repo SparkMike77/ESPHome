@@ -49,6 +49,14 @@ globals:
     type: bool
     restore_value: no
     initial_value: "true"
+  - id: is_speaking
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: is_blinking
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
 text_sensor:
   - platform: wifi_info
@@ -101,13 +109,14 @@ font:
 
 micro_wake_word:
   models:
-    - model: github://esphome/micro-wake-word-models/models/v2/hey_jarvis.json@main
+    - model: hey_jarvis.json #github://esphome/micro-wake-word-models/models/v2/hey_jarvis.json@main
   vad:
-    model: github://esphome/micro-wake-word-models/models/v2/vad.json@main
+    model: vad.json    #github://esphome/micro-wake-word-models/models/v2/vad.json@main
   on_wake_word_detected:
-    - lambda: |-
-        id(oled_display).turn_on();
-    - component.update: oled_display
+    - globals.set:
+        id: is_blinking
+        value: "true"
+    - lambda: id(oled_display).turn_on();
     - voice_assistant.start:
 
 voice_assistant:
@@ -118,18 +127,34 @@ voice_assistant:
   noise_suppression_level: 2
   auto_gain: 31dBFS
   volume_multiplier: 4.0
+  on_start:
+    - globals.set:
+        id: is_blinking
+        value: "false"
+  on_tts_start:
+    - globals.set:
+        id: is_speaking
+        value: "true"
+  on_tts_end:
+    - globals.set:
+        id: is_speaking
+        value: "false"
+    - script.execute: display_off_timer
   on_end:
-    - micro_wake_word.start
-    - delay: 2s
-    - lambda: |-
-        id(oled_display).turn_off();
+    - micro_wake_word.start:
+    - script.execute: display_off_timer
   on_error:
     - micro_wake_word.stop:
+    - globals.set:
+        id: is_blinking
+        value: "false"
+    - globals.set:
+        id: is_speaking
+        value: "false"
     - delay: 500ms
     - micro_wake_word.start:
     - delay: 2s
-    - lambda: |-
-        id(oled_display).turn_off();
+    - lambda: id(oled_display).turn_off();
 
 binary_sensor:
   - platform: gpio
@@ -240,20 +265,57 @@ light:
     name: "RGB LED"
     output: rgb_red
 
+script:
+  - id: display_off_timer
+    mode: restart
+    then:
+      - delay: 5s
+      - lambda: id(oled_display).turn_off();
+
 display:
   - platform: ssd1306_i2c
     id: oled_display
     model: "SSD1306 128x64"
     address: 0x3C
-    update_interval: never
+    update_interval: 500ms
     lambda: |-
-      it.print(0, 0, id(font_big), "Hello World");
-      if (id(init_done)) {
-        if (id(va).is_running()) {
-          it.print(0, 18, id(font_small), "Assist: active");
+      const int LEFT_X = 32, RIGHT_X = 96, EYE_Y = 32, EYE_R = 20;
+      int pupil_r = id(is_speaking) ? 5 : 2;
+      if (id(is_blinking)) {
+        bool closed = (millis() % 3000) < 150;
+        if (closed) {
+          it.line(LEFT_X - EYE_R, EYE_Y, LEFT_X + EYE_R, EYE_Y);
+          it.line(RIGHT_X - EYE_R, EYE_Y, RIGHT_X + EYE_R, EYE_Y);
         } else {
-          it.print(0, 18, id(font_small), "Assist: idle");
+          it.circle(LEFT_X, EYE_Y, EYE_R);
+          it.filled_circle(LEFT_X, EYE_Y, 2);
+          it.circle(RIGHT_X, EYE_Y, EYE_R);
+          it.filled_circle(RIGHT_X, EYE_Y, 2);
         }
-        it.print(0, 34, id(font_small), "Wake: waiting");
-        it.printf(0, 50, id(font_small), "WiFi: %s", id(wifi_name).state.c_str());
+      } else if (id(va).is_running()) {
+        uint32_t t = millis() % 5000;
+        int offset = 0;
+        if      (t > 1500 && t < 1800) offset = -8;
+        else if (t > 3200 && t < 3500) offset =  8;
+        bool closed = (millis() % 2000) < 150;
+        if (closed) {
+          it.line(LEFT_X - EYE_R, EYE_Y, LEFT_X + EYE_R, EYE_Y);
+          it.line(RIGHT_X - EYE_R, EYE_Y, RIGHT_X + EYE_R, EYE_Y);
+        } else {
+          it.circle(LEFT_X, EYE_Y, EYE_R);
+          it.filled_circle(LEFT_X + offset, EYE_Y, 2);
+          it.circle(RIGHT_X, EYE_Y, EYE_R);
+          it.filled_circle(RIGHT_X + offset, EYE_Y, 2);
+        }
+      } else {
+        bool closed = (millis() % 4000) < 150;
+        if (closed) {
+          it.line(LEFT_X - EYE_R, EYE_Y, LEFT_X + EYE_R, EYE_Y);
+          it.line(RIGHT_X - EYE_R, EYE_Y, RIGHT_X + EYE_R, EYE_Y);
+        } else {
+          it.circle(LEFT_X, EYE_Y, EYE_R);
+          it.filled_circle(LEFT_X, EYE_Y, 2);
+          it.circle(RIGHT_X, EYE_Y, EYE_R);
+          it.filled_circle(RIGHT_X, EYE_Y, 2);
+        }
       }
