@@ -9,7 +9,7 @@ esphome:
       - micro_wake_word.start:
 
 substitutions:
-  wake_word_triggered_sound_file: sounds/voiceinput3.wav
+  wake_sound_url: "http://homeassistant.local:8123/local/sounds/voiceinput3.wav"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -88,10 +88,6 @@ microphone:
     sample_rate: 16000
     bits_per_sample: 32bit
 
-audio_file:
-  - id: wake_word_triggered_sound
-    file: ${wake_word_triggered_sound_file}
-
 speaker:
   - platform: i2s_audio
     id: spk
@@ -125,7 +121,7 @@ micro_wake_word:
         id: is_blinking
         value: "true"
     - lambda: id(oled_display).turn_on();
-    - script.execute: play_sound
+    - media_player.play_media: "${wake_sound_url}"
     - voice_assistant.start:
 
 voice_assistant:
@@ -275,11 +271,6 @@ light:
     output: rgb_red
 
 script:
-  - id: play_sound
-    then:
-      - speaker.play:
-          id: spk
-          audio_file: wake_word_triggered_sound
   - id: display_off_timer
     mode: restart
     then:
