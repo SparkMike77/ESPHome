@@ -125,9 +125,7 @@ micro_wake_word:
         id: is_blinking
         value: "true"
     - lambda: id(oled_display).turn_on();
-    - script.execute:
-        id: play_sound
-        sound_file: "wake_word_triggered_sound"
+    - script.execute: play_sound
     - voice_assistant.start:
 
 voice_assistant:
@@ -278,15 +276,10 @@ light:
 
 script:
   - id: play_sound
-    parameters:
-      sound_file: string
     then:
-      - lambda: |-
-          id(announcement_player)
-            ->make_call()
-            .set_media_url("audio-file://" + sound_file)
-            .set_announcement(true)
-            .perform();
+      - speaker.play:
+          id: spk
+          audio_file: wake_word_triggered_sound
   - id: display_off_timer
     mode: restart
     then:
