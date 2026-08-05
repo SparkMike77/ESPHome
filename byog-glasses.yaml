@@ -1,0 +1,132 @@
+esphome:
+  name: byog-glasses
+  friendly_name: BYOG Glasses
+
+esp32:
+  board: seeed_xiao_esp32s3
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "byog-glasses-fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+substitutions:
+  feather_utterance_url: "http://10.10.10.41:8765/voice/utterance"
+  capture_ms: "4000"   # fixed-duration capture window - v1 simplification, no silence detection
+
+i2s_audio:
+  - id: i2s_mic
+    i2s_lrclk_pin: GPIO46
+    i2s_bclk_pin: GPIO42
+  - id: i2s_speaker
+    i2s_lrclk_pin: GPIOxx   # TODO: carrier board not finalized
+    i2s_bclk_pin: GPIOxx    # TODO
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: i2s_mic
+    i2s_din_pin: GPIO41
+    adc_type: external
+    pdm: true
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    on_data:
+      then:
+        - lambda: |-
+            if (id(is_capturing)) {
+              id(capture_buffer).insert(id(capture_buffer).end(), x.begin(), x.end());
+            }
+
+speaker:
+  - platform: i2s_audio
+    id: spk
+    i2s_audio_id: i2s_speaker
+    i2s_dout_pin: GPIOxx    # TODO
+    dac_type: external
+    channel: mono
+
+globals:
+  - id: is_capturing
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: capture_buffer
+    type: std::vector<uint8_t>
+    restore_value: no
+
+micro_wake_word:
+  models:
+    - model: hey_jarvis.json
+  vad:
+    model: vad.json
+  on_wake_word_detected:
+    - micro_wake_word.stop:
+    - globals.set:
+        id: is_capturing
+        value: "true"
+    - lambda: id(capture_buffer).clear();
+    - delay: ${capture_ms}
+    - globals.set:
+        id: is_capturing
+        value: "false"
+    - http_request.post:
+        url: ${feather_utterance_url}
+        request_headers:
+          Content-Type: audio/wav
+        body: !lambda |-
+          // 44-byte canonical WAV header, mono/16-bit/16kHz, prepended to the raw
+          // PCM capture - Feather's /voice/utterance endpoint expects a real WAV
+          // file, not headerless PCM.
+          uint32_t sample_rate = 16000;
+          uint16_t channels = 1, bits_per_sample = 16;
+          uint32_t data_len = id(capture_buffer).size();
+          uint32_t riff_len = 36 + data_len;
+          uint32_t byte_rate = sample_rate * channels * bits_per_sample / 8;
+          uint16_t block_align = channels * bits_per_sample / 8;
+          uint32_t fmt_len = 16;
+          uint16_t audio_format = 1;
+
+          std::string out;
+          out.reserve(44 + data_len);
+          out += "RIFF"; out.append((char*)&riff_len, 4); out += "WAVE";
+          out += "fmt "; out.append((char*)&fmt_len, 4);
+          out.append((char*)&audio_format, 2); out.append((char*)&channels, 2);
+          out.append((char*)&sample_rate, 4); out.append((char*)&byte_rate, 4);
+          out.append((char*)&block_align, 2); out.append((char*)&bits_per_sample, 2);
+          out += "data"; out.append((char*)&data_len, 4);
+          out.append((char*)id(capture_buffer).data(), data_len);
+          return out;
+        capture_response: true
+        max_response_buffer_size: 1048576
+        on_response:
+          then:
+            - if:
+                condition:
+                  lambda: return response->status_code == 200;
+                then:
+                  - speaker.play: !lambda return body;
+                else:
+                  - logger.log: "Feather /voice/utterance request failed"
+            - micro_wake_word.start:
