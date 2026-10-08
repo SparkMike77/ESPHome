@@ -346,6 +346,9 @@ script:
           auto now = id(sntp_time).now();
           std::string clock = now.is_valid() ? now.strftime("%H:%M") : std::string("--:--");
           lv_label_set_text(id(clock_label), clock.c_str());
+          auto utc = id(sntp_time).utcnow();
+          std::string utc_clock = utc.is_valid() ? utc.strftime("%H:%M UTC") : std::string("--:-- UTC");
+          lv_label_set_text(id(utc_label), utc_clock.c_str());
           std::string icons;
           if (id(quiet_hours)) icons += "\U000F0594";                    // mdi weather-night
           if (id(briefing_count) > 0) icons += "\U000F0219";             // mdi file-document
@@ -369,7 +372,7 @@ script:
                                id(clock_label), id(btn_stand_icon), id(btn_lamp_icon),
                                id(btn_sit_icon)};
           for (auto *o : texts) lv_obj_set_style_text_color(o, c(id(c_text)), LV_PART_MAIN);
-          lv_obj_t *muted[] = {id(status_label), id(briefing_label), id(empty_label), id(more_label),
+          lv_obj_t *muted[] = {id(status_label), id(utc_label), id(briefing_label), id(empty_label), id(more_label),
                                id(card0_ack), id(card1_ack), id(card2_ack),
                                id(card0_dismiss), id(card1_dismiss), id(card2_dismiss)};
           for (auto *o : muted) lv_obj_set_style_text_color(o, c(id(c_muted)), LV_PART_MAIN);
@@ -510,6 +513,13 @@ lvgl:
             text: "--:--"
             text_color: 0xe8ddc7
         - label:
+            id: utc_label
+            x: 50
+            y: 5
+            text: "--:-- UTC"
+            text_font: montserrat_12
+            text_color: 0xa08f6f
+        - label:
             id: briefing_label
             x: 222
             y: 3
@@ -518,9 +528,9 @@ lvgl:
             text_color: 0xa08f6f
         - label:
             id: status_label
-            x: 100
+            x: 130
             y: 3
-            width: 120
+            width: 90
             text_align: RIGHT
             text_font: mdi_14
             text: ""
