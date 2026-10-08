@@ -1,0 +1,693 @@
+# ============================================================
+# Schlafzimmer - Cheap Yellow Display (ESP32-2432S028, ILI9341 + XPT2046) as a Feather screen.
+#
+# Left: the Chronicle's notification list (Feather pushes it over the native API).
+# Right: three buttons that still go through Home Assistant - desk stand, ArmLight toggle, desk sit.
+#
+# Feather drives this over ESPHome's native API, the same way Home Assistant does
+# (feather/gjallarhorn/cyd.py, aioesphomeapi). Home Assistant stays connected too, for the
+# desk/lamp buttons - the API allows several clients at once.
+#
+# BUILD WITH ESPHome 2025.12.0 - the version the original firmware used, with touch working.
+# XPT2046 touch is reported broken on this board in 2026.4+ (esphome/esphome#16879). Do not
+# rebuild this from a newer ESPHome (e.g. the HA add-on) without re-checking that issue.
+#
+# Previous firmware: ../Schlafzimmer.YAML (the 12-button grid) - flash that back to undo.
+# ============================================================
+
+esphome:
+  name: schlafzimmer
+  friendly_name: Schlafzimmer
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: apply_backlight
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  actions:
+    # Kept from the original firmware, unchanged.
+    - action: set_desk_standing
+      then:
+        - homeassistant.action:
+            action: script.setdeskstanding
+    - action: set_desk_sitting
+      then:
+        - homeassistant.action:
+            action: script.setdesksitting
+
+    # ---- Feather -> screen ------------------------------------------------------------
+    # The notification list: up to 3 cards, plus how many more are waiting.
+    - action: show_notifications
+      variables:
+        ids: int[]
+        tiers: string[]
+        titles: string[]
+        more: int
+      then:
+        - lambda: |-
+            for (int i = 0; i < 3; i++) {
+              bool used = i < (int) ids.size() && i < (int) titles.size();
+              id(card_ids)[i] = used ? ids[i] : 0;
+              id(card_tiers)[i] = used && i < (int) tiers.size() ? tiers[i] : std::string("");
+              id(card_titles)[i] = used ? titles[i] : std::string("");
+            }
+            id(more_count) = more;
+        - script.execute: render_cards
+
+    # Status bar: briefing items ready, and whether it's quiet hours.
+    - action: set_status
+      variables:
+        briefing: int
+        quiet: bool
+      then:
+        - lambda: |-
+            id(briefing_count) = briefing;
+            id(quiet_hours) = quiet;
+        - script.execute: render_status
+
+    # Backlight level Feather wants (0 = off). A touch still wakes the screen locally for 30 s.
+    - action: set_backlight
+      variables:
+        level: float
+      then:
+        - lambda: |-
+            id(base_level) = level;
+        - script.execute: apply_backlight
+
+    # Palette pushed from Feather's current web UI theme (0xRRGGBB values).
+    - action: set_theme
+      variables:
+        bg: int
+        surface: int
+        border: int
+        accent: int
+        fg: int
+        muted: int
+      then:
+        - lambda: |-
+            id(c_bg) = bg; id(c_surface) = surface; id(c_border) = border;
+            id(c_accent) = accent; id(c_text) = fg; id(c_muted) = muted;
+        - script.execute: apply_theme
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: Schlafzimmer Fallback Hotspot
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Edmonton
+    on_time_sync:
+      then:
+        - script.execute: render_status
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: render_status
+
+# ============================================================
+# State
+# ============================================================
+globals:
+  - id: card_ids
+    type: std::array<int, 3>
+    restore_value: no
+  - id: card_tiers
+    type: std::array<std::string, 3>
+    restore_value: no
+  - id: card_titles
+    type: std::array<std::string, 3>
+    restore_value: no
+  - id: more_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: briefing_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: quiet_hours
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: base_level            # what Feather asked for
+    type: float
+    restore_value: no
+    initial_value: "0.6"
+  - id: awake_until           # millis() until which a touch keeps the screen fully lit
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: finger_down           # set by on_touch, cleared by on_release
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: action_seq            # makes every feather_action value unique, so repeats still report
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: last_touch_report     # millis() of the last "touch" sent to Feather (throttle)
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Theme - Norse until Feather pushes the current one.
+  - {id: c_bg,      type: int, restore_value: no, initial_value: "0x0b0906"}
+  - {id: c_surface, type: int, restore_value: no, initial_value: "0x1c150e"}
+  - {id: c_border,  type: int, restore_value: no, initial_value: "0x6b5637"}
+  - {id: c_accent,  type: int, restore_value: no, initial_value: "0xc9a24b"}
+  - {id: c_text,    type: int, restore_value: no, initial_value: "0xe8ddc7"}
+  - {id: c_muted,   type: int, restore_value: no, initial_value: "0xa08f6f"}
+
+# ============================================================
+# Screen -> Feather: card taps and wake-ups, as a text sensor Feather subscribes to.
+# Values look like "ack:42:7" / "dismiss:42:8" / "wake:0:9" (action:entry:sequence).
+# ============================================================
+text_sensor:
+  - platform: template
+    id: feather_action
+    name: "Feather action"
+    update_interval: never
+
+# ============================================================
+# Lights, sensors
+# ============================================================
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: Display Backlight
+    id: backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 300ms
+  - platform: rgb
+    id: led
+    name: Status LED
+    red: output_red
+    green: output_green
+    blue: output_blue
+    restore_mode: ALWAYS_OFF
+
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_pwm
+  - {platform: ledc, pin: GPIO4,  id: output_red,   inverted: true}
+  - {platform: ledc, pin: GPIO16, id: output_green, inverted: true}
+  - {platform: ledc, pin: GPIO17, id: output_blue,  inverted: true}
+
+sensor:
+  # Light-dependent resistor on the front. Raw volts in, % out (calibration from the original
+  # firmware: full dark 1.039 V with the backlight off, full light 0.075 V). Feather reads this to
+  # pick a backlight level that's just visible in the room's current light.
+  - platform: adc
+    pin: GPIO34
+    id: board_ldr
+    update_interval: 1000ms
+    internal: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 10
+  - platform: copy
+    source_id: board_ldr
+    name: "Ambient Light"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    filters:
+      - lambda: return min(max((100 - (((x - 0.075) / (1.039 - 0.075)) * 100)), 0.0), 100.0);
+      # Heartbeat too: Feather only trusts readings taken a while after the backlight went off,
+      # and with delta alone a steady dark room would never send another one.
+      - or:
+          - delta: 2.0
+          - heartbeat: 60s
+
+binary_sensor:
+  # The ArmLight's state, from Home Assistant, so its button shows on/off.
+  - platform: homeassistant
+    id: armlight_on
+    entity_id: light.armlight
+    on_state:
+      - lvgl.widget.update:
+          id: btn_lamp
+          state:
+            checked: !lambda return x;
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(awake_until) != 0 && (int32_t) (millis() - id(awake_until)) >= 0) {
+            id(awake_until) = 0;
+            id(apply_backlight).execute();
+          }
+
+# ============================================================
+# Scripts
+# ============================================================
+script:
+  - id: apply_backlight
+    then:
+      - lambda: |-
+          bool awake = id(awake_until) != 0;
+          float level = awake ? 1.0f : id(base_level);
+          auto call = level > 0.005f ? id(backlight).turn_on() : id(backlight).turn_off();
+          if (level > 0.005f) call.set_brightness(level);
+          call.perform();
+          // While dark or dim, a full-screen catcher takes the first touch, so waking the screen
+          // can never also press a button underneath it. It's put up at once but only taken down
+          // after a delay (lower_catcher): removing it while the waking finger is still down let
+          // that same press land on the card underneath and acknowledge it (found 2026-10-06).
+          if (level < 0.35f) lv_obj_clear_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
+          else id(lower_catcher).execute();
+
+  - id: lower_catcher
+    mode: restart
+    then:
+      - delay: 250ms
+      - lambda: |-
+          bool lit = id(awake_until) != 0 || id(base_level) >= 0.35f;
+          // finger_down is tracked from on_touch/on_release: the driver's get_touches() isn't
+          // emptied on release, which kept the catcher up forever (every tap became a "wake").
+          if (lit && !id(finger_down)) lv_obj_add_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
+          else if (lit) id(lower_catcher).execute();   // finger still down - try again shortly
+
+  - id: wake_screen
+    then:
+      - lambda: |-
+          id(awake_until) = millis() + 30000;
+          id(feather_action).publish_state(str_sprintf("wake:0:%u", ++id(action_seq)));
+          id(apply_backlight).execute();
+
+  - id: send_action
+    parameters:
+      action: string
+      slot: int
+    then:
+      - lambda: |-
+          int entry = id(card_ids)[slot];
+          ESP_LOGI("feather", "card %d %s pressed (entry %d)", slot, action.c_str(), entry);
+          if (entry == 0) return;
+          // The touch panel can read noise while it starts up - nothing acts in the first 15 s.
+          if (millis() < 15000) { ESP_LOGW("feather", "ignored - within 15 s of boot"); return; }
+          id(feather_action).publish_state(str_sprintf("%s:%d:%u", action.c_str(), entry, ++id(action_seq)));
+          id(awake_until) = millis() + 30000;   // stay lit while the person is using it
+
+  - id: render_cards
+    then:
+      - lambda: |-
+          lv_obj_t *cards[3] = {id(card0), id(card1), id(card2)};
+          lv_obj_t *titles[3] = {id(card0_title), id(card1_title), id(card2_title)};
+          lv_obj_t *tiers[3] = {id(card0_tier), id(card1_tier), id(card2_tier)};
+          int shown = 0;
+          for (int i = 0; i < 3; i++) {
+            if (id(card_ids)[i] == 0) { lv_obj_add_flag(cards[i], LV_OBJ_FLAG_HIDDEN); continue; }
+            shown++;
+            lv_obj_clear_flag(cards[i], LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(titles[i], id(card_titles)[i].c_str());
+            const std::string &t = id(card_tiers)[i];
+            lv_label_set_text(tiers[i], t.c_str());
+            // Tier colour: P0/P1 red, P2 amber, otherwise the theme's accent.
+            uint32_t edge = (t == "P0" || t == "P1") ? 0xc0392b : (t == "P2" ? 0xd4a017 : (uint32_t) id(c_accent));
+            lv_obj_set_style_border_color(cards[i], lv_color_hex(edge), LV_PART_MAIN);
+            lv_obj_set_style_text_color(tiers[i], lv_color_hex(edge), LV_PART_MAIN);
+          }
+          if (shown == 0) lv_obj_clear_flag(id(empty_label), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_add_flag(id(empty_label), LV_OBJ_FLAG_HIDDEN);
+          if (id(more_count) > 0) {
+            lv_label_set_text(id(more_label), str_sprintf("+%d more", id(more_count)).c_str());
+            lv_obj_clear_flag(id(more_label), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(more_label), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  - id: render_status
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          std::string clock = now.is_valid() ? now.strftime("%H:%M") : std::string("--:--");
+          lv_label_set_text(id(clock_label), clock.c_str());
+          std::string icons;
+          if (id(quiet_hours)) icons += "\U000F0594";                    // mdi weather-night
+          if (id(briefing_count) > 0) icons += "\U000F0219";             // mdi file-document
+          lv_label_set_text(id(status_label), icons.c_str());
+          std::string count = id(briefing_count) > 0 ? str_sprintf("%d", id(briefing_count)) : std::string("");
+          lv_label_set_text(id(briefing_label), count.c_str());
+
+  - id: apply_theme
+    then:
+      - lambda: |-
+          auto c = [](int v) { return lv_color_hex((uint32_t) v); };
+          lv_obj_set_style_bg_color(id(main_page)->obj, c(id(c_bg)), LV_PART_MAIN);
+          lv_obj_t *surfaces[] = {id(card0), id(card1), id(card2),
+                                  id(btn_stand), id(btn_lamp), id(btn_sit)};
+          for (auto *o : surfaces) {
+            lv_obj_set_style_bg_color(o, c(id(c_surface)), LV_PART_MAIN);
+            lv_obj_set_style_border_color(o, c(id(c_border)), LV_PART_MAIN);
+          }
+          lv_obj_set_style_bg_color(id(btn_lamp), c(id(c_accent)), LV_PART_MAIN | LV_STATE_CHECKED);
+          lv_obj_t *texts[] = {id(card0_title), id(card1_title), id(card2_title),
+                               id(clock_label), id(btn_stand_icon), id(btn_lamp_icon),
+                               id(btn_sit_icon)};
+          for (auto *o : texts) lv_obj_set_style_text_color(o, c(id(c_text)), LV_PART_MAIN);
+          lv_obj_t *muted[] = {id(status_label), id(briefing_label), id(empty_label), id(more_label),
+                               id(card0_ack), id(card1_ack), id(card2_ack),
+                               id(card0_dismiss), id(card1_dismiss), id(card2_dismiss)};
+          for (auto *o : muted) lv_obj_set_style_text_color(o, c(id(c_muted)), LV_PART_MAIN);
+      - script.execute: render_cards
+
+# ============================================================
+# Display + touch
+# ============================================================
+spi:
+  - id: tft
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: touch
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+display:
+  - platform: ili9xxx
+    id: tft_display
+    model: ili9341
+    spi_id: tft
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    invert_colors: false
+    color_palette: 8BIT      # the board has no PSRAM - LVGL draws through its own smaller buffer
+    dimensions:
+      width: 320
+      height: 240
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  platform: xpt2046
+  id: tft_touch
+  spi_id: touch
+  cs_pin: GPIO33
+  interrupt_pin: GPIO36
+  update_interval: 50ms
+  threshold: 400
+  calibration:
+    x_min: 180
+    x_max: 3800
+    y_min: 240
+    y_max: 3860
+  transform:
+    swap_xy: true
+    # The original firmware drew its grid mirrored relative to touch (its "3 - col"), i.e. touch
+    # X runs opposite to display X. CHECK ON FIRST BOOT: if taps land on the wrong side, flip this.
+    mirror_x: true
+  on_release:
+    then:
+      - lambda: id(finger_down) = false;
+  on_touch:
+    then:
+      - lambda: |-
+          id(finger_down) = true;
+          ESP_LOGI("touch", "touch x=%d y=%d (raw %d,%d)", touch.x, touch.y, touch.x_raw, touch.y_raw);
+      - if:
+          condition:
+            lambda: return id(awake_until) == 0 && id(base_level) < 0.35f;
+          then:
+            - script.execute: wake_screen
+          else:
+            # Already lit: someone's using it. Keep a local wake going, and tell Feather (at most
+            # every 5 s) so its idle timeout restarts too - desk/lamp/blank-area taps send nothing
+            # else, and the screen used to go dark mid-use.
+            - lambda: |-
+                if (id(awake_until) != 0) id(awake_until) = millis() + 30000;
+                if (millis() < 15000) return;   // touch noise while the panel starts up
+                if (id(last_touch_report) != 0 && millis() - id(last_touch_report) < 5000) return;
+                id(last_touch_report) = millis();
+                id(feather_action).publish_state(str_sprintf("touch:0:%u", ++id(action_seq)));
+
+# ============================================================
+# Fonts: LVGL's built-in Montserrat for text; Material Design Icons for the buttons/status.
+# ============================================================
+font:
+  - file:
+      type: web
+      url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
+    id: mdi_36
+    size: 36
+    bpp: 4
+    glyphs: ["\U000F0CE1", "\U000F0CDB", "\U000F06B5"]   # arrow-up-bold-box, arrow-down-bold-box, lamp
+  - file:
+      type: web
+      url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
+    id: mdi_14
+    size: 14
+    bpp: 4
+    glyphs: ["\U000F0594", "\U000F0219"]                 # weather-night, file-document (icons only - no space/digits in this font)
+
+# ============================================================
+# LVGL layout - 320x240 landscape.  [ notifications 0..244 | buttons 248..320 ]
+# ============================================================
+lvgl:
+  displays: [tft_display]
+  touchscreens: [tft_touch]
+  buffer_size: 25%
+  color_depth: 16
+  default_font: montserrat_14
+  style_definitions:
+    - id: card_style
+      bg_color: 0x1c150e
+      bg_opa: COVER
+      border_color: 0x6b5637
+      border_width: 2
+      radius: 4
+      pad_all: 4
+    - id: side_btn_style
+      bg_color: 0x1c150e
+      bg_opa: COVER
+      border_color: 0x6b5637
+      border_width: 2
+      radius: 4
+      shadow_width: 0
+    - id: small_btn_style
+      # Big, outlined targets: the XPT2046 is jittery, and LVGL drops a click whose press and
+      # release don't land on the same object - text-sized buttons lost most taps.
+      bg_opa: TRANSP
+      border_width: 1
+      border_color: 0x6b5637
+      radius: 3
+      shadow_width: 0
+      pad_all: 0
+  pages:
+    - id: main_page
+      bg_color: 0x0b0906
+      scrollable: false
+      widgets:
+        # ---- status bar
+        - label:
+            id: clock_label
+            x: 6
+            y: 3
+            text: "--:--"
+            text_color: 0xe8ddc7
+        - label:
+            id: briefing_label
+            x: 222
+            y: 3
+            width: 22
+            text: ""
+            text_color: 0xa08f6f
+        - label:
+            id: status_label
+            x: 100
+            y: 3
+            width: 120
+            text_align: RIGHT
+            text_font: mdi_14
+            text: ""
+            text_color: 0xa08f6f
+        - label:
+            id: empty_label
+            x: 6
+            y: 110
+            width: 236
+            text_align: CENTER
+            text: "Nothing waiting on you."
+            text_color: 0xa08f6f
+
+        # ---- three notification cards
+        - obj:
+            id: card0
+            styles: card_style
+            x: 4
+            y: 24
+            width: 240
+            height: 66
+            hidden: true
+            scrollable: false
+            widgets:
+              - label: {id: card0_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
+              - label: {id: card0_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - button:
+                  id: card0_ack
+                  styles: small_btn_style
+                  x: 0
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Got it", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "ack", slot: 0}]
+              - button:
+                  id: card0_dismiss
+                  styles: small_btn_style
+                  x: 116
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Dismiss", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "dismiss", slot: 0}]
+        - obj:
+            id: card1
+            styles: card_style
+            x: 4
+            y: 94
+            width: 240
+            height: 66
+            hidden: true
+            scrollable: false
+            widgets:
+              - label: {id: card1_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
+              - label: {id: card1_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - button:
+                  id: card1_ack
+                  styles: small_btn_style
+                  x: 0
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Got it", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "ack", slot: 1}]
+              - button:
+                  id: card1_dismiss
+                  styles: small_btn_style
+                  x: 116
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Dismiss", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "dismiss", slot: 1}]
+        - obj:
+            id: card2
+            styles: card_style
+            x: 4
+            y: 164
+            width: 240
+            height: 66
+            hidden: true
+            scrollable: false
+            widgets:
+              - label: {id: card2_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
+              - label: {id: card2_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - button:
+                  id: card2_ack
+                  styles: small_btn_style
+                  x: 0
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Got it", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "ack", slot: 2}]
+              - button:
+                  id: card2_dismiss
+                  styles: small_btn_style
+                  x: 116
+                  y: 32
+                  width: 112
+                  height: 26
+                  widgets: [label: {text: "Dismiss", align: CENTER, text_font: montserrat_14}]
+                  on_click: [script.execute: {id: send_action, action: "dismiss", slot: 2}]
+        - label:
+            id: more_label
+            x: 170
+            y: 230
+            text: ""
+            text_font: montserrat_12
+            hidden: true
+
+        # ---- the side column: desk stand / ArmLight / desk sit - all through Home Assistant
+        - button:
+            id: btn_stand
+            styles: side_btn_style
+            x: 250
+            y: 6
+            width: 66
+            height: 72
+            widgets:
+              - label: {id: btn_stand_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CE1", text_color: 0xe8ddc7}
+            on_click:
+              - homeassistant.action:
+                  action: script.setdeskstanding
+        - button:
+            id: btn_lamp
+            styles: side_btn_style
+            x: 250
+            y: 84
+            width: 66
+            height: 72
+            checkable: true
+            widgets:
+              - label: {id: btn_lamp_icon, align: CENTER, text_font: mdi_36, text: "\U000F06B5", text_color: 0xe8ddc7}
+            on_click:
+              - homeassistant.action:
+                  action: light.toggle
+                  data:
+                    entity_id: light.armlight
+        - button:
+            id: btn_sit
+            styles: side_btn_style
+            x: 250
+            y: 162
+            width: 66
+            height: 72
+            widgets:
+              - label: {id: btn_sit_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CDB", text_color: 0xe8ddc7}
+            on_click:
+              - homeassistant.action:
+                  action: script.setdesksitting
+
+        # ---- invisible full-screen catcher, only shown while the screen is dark/dim
+        - obj:
+            id: wake_catcher
+            x: 0
+            y: 0
+            width: 320
+            height: 240
+            bg_opa: TRANSP
+            border_width: 0
+            hidden: true
+            on_click:
+              # Already awake: just get out of the way so the next tap reaches the buttons.
+              # (Re-waking here restarted the catcher's countdown, so quick taps after a wake
+              # kept landing on the catcher - Dismiss took several tries.)
+              - lambda: |-
+                  if (id(awake_until) != 0) lv_obj_add_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
+                  else id(wake_screen).execute();
