@@ -424,6 +424,10 @@ touchscreen:
     # The original firmware drew its grid mirrored relative to touch (its "3 - col"), i.e. touch
     # X runs opposite to display X. CHECK ON FIRST BOOT: if taps land on the wrong side, flip this.
     mirror_x: true
+    # Touch Y was upside down relative to the display (2026-10-10): taps on a top card's "Got it"
+    # (y ~70) arrived at y ~170, so card buttons never fired and desk Stand/Sit were swapped. The
+    # lamp, dead centre vertically, was the only control that worked either way.
+    mirror_y: true
   on_release:
     then:
       - lambda: id(finger_down) = false;
