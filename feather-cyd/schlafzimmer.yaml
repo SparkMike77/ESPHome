@@ -83,6 +83,36 @@ api:
             id(base_level) = level;
         - script.execute: apply_backlight
 
+    # The LLM page (tap the status bar), pre-formatted by Feather (feather/gjallarhorn/cyd.py
+    # llm_snapshot), plus the status-bar health glyph: 0 = hidden, 1 = amber, 2 = red.
+    - action: set_llm
+      variables:
+        health: int
+        reason: string
+        model: string
+        gpu: string
+        vram_pct: int
+        vram: string
+        gen: string
+        prefill: string
+        reuse: string
+        turns: string
+      then:
+        - lambda: |-
+            id(llm_health) = health;
+            lv_label_set_text(id(llm_model), model.c_str());
+            lv_label_set_text(id(llm_gpu), gpu.c_str());
+            lv_label_set_text(id(llm_vram), vram.c_str());
+            lv_label_set_text(id(llm_gen), gen.c_str());
+            lv_label_set_text(id(llm_prefill), prefill.c_str());
+            lv_label_set_text(id(llm_reuse), reuse.c_str());
+            lv_label_set_text(id(llm_turns), turns.c_str());
+            lv_label_set_text(id(llm_reason), reason.c_str());
+        - lvgl.bar.update:
+            id: llm_vram_bar
+            value: !lambda return vram_pct;
+        - script.execute: render_health
+
     # Palette pushed from Feather's current web UI theme (0xRRGGBB values).
     - action: set_theme
       variables:
@@ -169,6 +199,10 @@ globals:
     initial_value: "0"
   - id: last_touch_report     # millis() of the last "touch" sent to Feather (throttle)
     type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: llm_health            # 0 fine, 1 amber, 2 red (set_llm)
+    type: int
     restore_value: no
     initial_value: "0"
   # Theme - Norse until Feather pushes the current one.
@@ -356,13 +390,41 @@ script:
           std::string count = id(briefing_count) > 0 ? str_sprintf("%d", id(briefing_count)) : std::string("");
           lv_label_set_text(id(briefing_label), count.c_str());
 
+  # The glyph only shows when something on the LLM page needs a look; the reason line there
+  # takes the same colour.
+  - id: render_health
+    then:
+      - lambda: |-
+          int h = id(llm_health);
+          uint32_t col = h >= 2 ? 0xc0392b : 0xd4a017;
+          if (h > 0) {
+            lv_obj_set_style_text_color(id(health_label), lv_color_hex(col), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(llm_reason), lv_color_hex(col), LV_PART_MAIN);
+            lv_obj_clear_flag(id(health_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(llm_reason), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(health_label), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(llm_reason), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  # The LLM page goes back to the notifications by itself after 30 s.
+  - id: show_llm_page
+    mode: restart
+    then:
+      - lvgl.page.show: llm_page
+      - delay: 30s
+      - lvgl.page.show: main_page
+
   - id: apply_theme
     then:
       - lambda: |-
           auto c = [](int v) { return lv_color_hex((uint32_t) v); };
           lv_obj_set_style_bg_color(id(main_page)->obj, c(id(c_bg)), LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(llm_page)->obj, c(id(c_bg)), LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(llm_vram_bar), c(id(c_surface)), LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(llm_vram_bar), c(id(c_accent)), LV_PART_INDICATOR);
           lv_obj_t *surfaces[] = {id(card0), id(card1), id(card2),
-                                  id(btn_stand), id(btn_lamp), id(btn_sit)};
+                                  id(btn_stand), id(btn_lamp), id(btn_sit), id(llm_back)};
           for (auto *o : surfaces) {
             lv_obj_set_style_bg_color(o, c(id(c_surface)), LV_PART_MAIN);
             lv_obj_set_style_border_color(o, c(id(c_border)), LV_PART_MAIN);
@@ -370,13 +432,16 @@ script:
           lv_obj_set_style_bg_color(id(btn_lamp), c(id(c_accent)), LV_PART_MAIN | LV_STATE_CHECKED);
           lv_obj_t *texts[] = {id(card0_title), id(card1_title), id(card2_title),
                                id(clock_label), id(btn_stand_icon), id(btn_lamp_icon),
-                               id(btn_sit_icon)};
+                               id(btn_sit_icon), id(llm_title), id(llm_model), id(llm_gpu), id(llm_vram),
+                               id(llm_gen), id(llm_prefill), id(llm_reuse), id(llm_turns), id(llm_back_label)};
           for (auto *o : texts) lv_obj_set_style_text_color(o, c(id(c_text)), LV_PART_MAIN);
           lv_obj_t *muted[] = {id(status_label), id(utc_label), id(briefing_label), id(empty_label), id(more_label),
                                id(card0_ack), id(card1_ack), id(card2_ack),
-                               id(card0_dismiss), id(card1_dismiss), id(card2_dismiss)};
+                               id(card0_dismiss), id(card1_dismiss), id(card2_dismiss),
+                               id(llm_gen_cap), id(llm_prefill_cap), id(llm_reuse_cap), id(llm_turns_cap)};
           for (auto *o : muted) lv_obj_set_style_text_color(o, c(id(c_muted)), LV_PART_MAIN);
       - script.execute: render_cards
+      - script.execute: render_health
 
 # ============================================================
 # Display + touch
@@ -469,7 +534,7 @@ font:
     id: mdi_14
     size: 14
     bpp: 4
-    glyphs: ["\U000F0594", "\U000F0219"]                 # weather-night, file-document (icons only - no space/digits in this font)
+    glyphs: ["\U000F0594", "\U000F0219", "\U000F0028"]   # weather-night, file-document, alert-circle (icons only - no space/digits in this font)
 
 # ============================================================
 # LVGL layout - 320x240 landscape.  [ notifications 0..244 | buttons 248..320 ]
@@ -539,6 +604,26 @@ lvgl:
             text_font: mdi_14
             text: ""
             text_color: 0xa08f6f
+        - label:
+            id: health_label          # LLM health - hidden unless something needs a look
+            x: 114
+            y: 3
+            text_font: mdi_14
+            text: "\U000F0028"
+            text_color: 0xd4a017
+            hidden: true
+        # Tapping the clock / UTC / health glyph opens the LLM page. An invisible target over the
+        # left of the status bar (labels are too small to hit reliably on the XPT2046).
+        - obj:
+            id: status_tap
+            x: 0
+            y: 0
+            width: 132
+            height: 22
+            bg_opa: TRANSP
+            border_width: 0
+            on_click:
+              - script.execute: show_llm_page
         - label:
             id: empty_label
             x: 6
@@ -705,3 +790,49 @@ lvgl:
               - lambda: |-
                   if (id(awake_until) != 0) lv_obj_add_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
                   else id(wake_screen).execute();
+
+    # ---- the LLM page: Feather's model, GPU and speeds (set_llm). Opened from the status bar,
+    # back to the notifications on Back or after 30 s (show_llm_page).
+    - id: llm_page
+      bg_color: 0x0b0906
+      scrollable: false
+      widgets:
+        - label: {id: llm_title, x: 6, y: 8, text: "LLM", text_color: 0xe8ddc7}
+        - button:
+            id: llm_back
+            styles: side_btn_style
+            x: 228
+            y: 2
+            width: 88
+            height: 30
+            widgets:
+              - label: {id: llm_back_label, align: CENTER, text: "Back", text_color: 0xe8ddc7}
+            on_click:
+              - script.stop: show_llm_page
+              - lvgl.page.show: main_page
+        - label: {id: llm_model, x: 6, y: 40, width: 308, long_mode: DOT, text: "waiting for Feather", text_color: 0xe8ddc7}
+        - bar:
+            id: llm_vram_bar
+            x: 6
+            y: 66
+            width: 190
+            height: 12
+            min_value: 0
+            max_value: 100
+            value: 0
+            bg_color: 0x1c150e
+            radius: 3
+            indicator:
+              bg_color: 0xc9a24b
+              radius: 3
+        - label: {id: llm_vram, x: 204, y: 63, width: 110, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_gpu, x: 6, y: 88, width: 308, long_mode: DOT, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_reason, x: 6, y: 110, width: 308, long_mode: DOT, text: "", hidden: true}
+        - label: {id: llm_gen_cap, x: 6, y: 136, text: "Generation", text_color: 0xa08f6f}
+        - label: {id: llm_gen, x: 112, y: 136, width: 202, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_prefill_cap, x: 6, y: 160, text: "Prefill (cold)", text_color: 0xa08f6f}
+        - label: {id: llm_prefill, x: 112, y: 160, width: 202, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_reuse_cap, x: 6, y: 184, text: "Cache reuse", text_color: 0xa08f6f}
+        - label: {id: llm_reuse, x: 112, y: 184, width: 202, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_turns_cap, x: 6, y: 208, text: "Last turn", text_color: 0xa08f6f}
+        - label: {id: llm_turns, x: 112, y: 208, width: 202, text: "-", text_color: 0xe8ddc7}
