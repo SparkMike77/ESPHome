@@ -127,6 +127,7 @@ api:
       then:
         - lambda: |-
             id(image_mode) = true;
+            id(image_drawn_at) = millis();
             int s = (int) seconds;
             uint32_t ms = (uint32_t) std::max(5, std::min(s, 3600)) * 1000;
             id(image_until) = millis() + ms;
@@ -148,6 +149,7 @@ api:
             if (h <= 0 || y < 0 || y + h > 240) return;
             id(tft_display).draw_pixels_at(0, y, 320, h, buf, display::COLOR_ORDER_RGB,
                                            display::COLOR_BITNESS_565, true, 0, 0, 0);
+            id(image_drawn_at) = millis();
 
     - action: hide_image
       then:
@@ -246,6 +248,10 @@ globals:
     restore_value: no
     initial_value: "false"
   - id: image_until           # millis() when it comes down on its own
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: image_drawn_at        # millis() of the last strip - touches just after it are ignored
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -567,9 +573,18 @@ touchscreen:
       - lambda: |-
           id(finger_down) = true;
           ESP_LOGI("touch", "touch x=%d y=%d (raw %d,%d)", touch.x, touch.y, touch.x_raw, touch.y_raw);
+      # A tap takes a picture down - but not while it's drawing or just after: streaming 150 KB
+      # to the panel makes the XPT2046 read a phantom press near the middle (raw ~2000/2000,
+      # z just over threshold), which took every picture down the moment it finished (2026-10-19).
       - if:
           condition:
-            lambda: return id(image_mode);
+            lambda: |-
+              if (!id(image_mode)) return false;
+              if (millis() - id(image_drawn_at) < 1500) {
+                ESP_LOGD("feather", "touch ignored - picture drawing");
+                return false;
+              }
+              return true;
           then:
             - script.execute: image_exit
       - if:
@@ -615,6 +630,10 @@ lvgl:
   touchscreens: [tft_touch]
   buffer_size: 25%
   color_depth: 16
+  # LVGL is only ever paused while a picture is up (show_image_begin). Its default resume_on_input
+  # would un-pause on any touch - including the phantom one the panel reads while a picture streams
+  # in - and repaint the notifications over the picture. Only image_exit resumes it.
+  resume_on_input: false
   default_font: montserrat_14
   style_definitions:
     - id: card_style
