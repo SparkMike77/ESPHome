@@ -13,6 +13,12 @@
 # rebuild this from a newer ESPHome (e.g. the HA add-on) without re-checking that issue.
 #
 # Previous firmware: ../Schlafzimmer.YAML (the 12-button grid) - flash that back to undo.
+#
+# Pictures (2026-10-19): Feather can put any image on screen (its show_on_screen tool). Feather
+# fits it to 320x240 and sends it as raw RGB565 in strips (show_image_rows), which go straight to
+# the panel - a full frame is 150 KB and this board has no PSRAM, so it's never held here. LVGL
+# is paused meanwhile; a tap (or the picture's timeout) brings the notifications back behind the
+# wake catcher, so the tap that dismisses a picture can never also press the desk buttons.
 # ============================================================
 
 esphome:
@@ -113,6 +119,40 @@ api:
             value: !lambda return vram_pct;
         - script.execute: render_health
 
+    # ---- pictures (feather/gjallarhorn/cyd.py show_image) ----------------------------------
+    # Start: pause the touch UI and keep the screen lit for `seconds` (5-3600).
+    - action: show_image_begin
+      variables:
+        seconds: int
+      then:
+        - lambda: |-
+            id(image_mode) = true;
+            int s = (int) seconds;
+            uint32_t ms = (uint32_t) std::max(5, std::min(s, 3600)) * 1000;
+            id(image_until) = millis() + ms;
+            id(awake_until) = id(image_until);
+        - lvgl.pause:
+        - script.execute: apply_backlight
+
+    # A strip of the picture: up to 8 full-width rows of big-endian RGB565, base64, starting at y.
+    - action: show_image_rows
+      variables:
+        y: int
+        data: string
+      then:
+        - lambda: |-
+            if (!id(image_mode)) return;
+            static uint8_t buf[320 * 8 * 2];
+            size_t n = esphome::base64_decode(data, buf, sizeof(buf));
+            int h = (int) (n / (320 * 2));
+            if (h <= 0 || y < 0 || y + h > 240) return;
+            id(tft_display).draw_pixels_at(0, y, 320, h, buf, display::COLOR_ORDER_RGB,
+                                           display::COLOR_BITNESS_565, true, 0, 0, 0);
+
+    - action: hide_image
+      then:
+        - script.execute: image_exit
+
     # Palette pushed from Feather's current web UI theme (0xRRGGBB values).
     - action: set_theme
       variables:
@@ -201,17 +241,25 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: image_mode            # a picture is up (show_image_begin) - LVGL is paused
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: image_until           # millis() when it comes down on its own
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   - id: llm_health            # 0 fine, 1 amber, 2 red (set_llm)
     type: int
     restore_value: no
     initial_value: "0"
-  # Theme - Norse until Feather pushes the current one.
-  - {id: c_bg,      type: int, restore_value: no, initial_value: "0x0b0906"}
-  - {id: c_surface, type: int, restore_value: no, initial_value: "0x1c150e"}
-  - {id: c_border,  type: int, restore_value: no, initial_value: "0x6b5637"}
-  - {id: c_accent,  type: int, restore_value: no, initial_value: "0xc9a24b"}
-  - {id: c_text,    type: int, restore_value: no, initial_value: "0xe8ddc7"}
-  - {id: c_muted,   type: int, restore_value: no, initial_value: "0xa08f6f"}
+  # Theme - Norse (forest and field, 2026-10-18) until Feather pushes the current one.
+  - {id: c_bg,      type: int, restore_value: no, initial_value: "0x0e1a14"}
+  - {id: c_surface, type: int, restore_value: no, initial_value: "0x16271e"}
+  - {id: c_border,  type: int, restore_value: no, initial_value: "0x4d6650"}
+  - {id: c_accent,  type: int, restore_value: no, initial_value: "0xd4a95a"}
+  - {id: c_text,    type: int, restore_value: no, initial_value: "0xece4d0"}
+  - {id: c_muted,   type: int, restore_value: no, initial_value: "0xa9b096"}
 
 # ============================================================
 # Screen -> Feather: card taps and wake-ups, as a text sensor Feather subscribes to.
@@ -294,6 +342,7 @@ interval:
             id(awake_until) = 0;
             id(apply_backlight).execute();
           }
+          if (id(image_mode) && (int32_t) (millis() - id(image_until)) >= 0) id(image_exit).execute();
 
 # ============================================================
 # Scripts
@@ -324,6 +373,23 @@ script:
           // emptied on release, which kept the catcher up forever (every tap became a "wake").
           if (lit && !id(finger_down)) lv_obj_add_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
           else if (lit) id(lower_catcher).execute();   // finger still down - try again shortly
+
+  # Back from a picture to the notifications. The catcher goes up first, and lower_catcher only
+  # takes it down once the finger has lifted - so a dismissing tap lands on the catcher, never on
+  # a card or the desk buttons underneath.
+  - id: image_exit
+    then:
+      - if:
+          condition:
+            lambda: return id(image_mode);
+          then:
+            - lambda: |-
+                id(image_mode) = false;
+                lv_obj_clear_flag(id(wake_catcher), LV_OBJ_FLAG_HIDDEN);
+                id(feather_action).publish_state(str_sprintf("image_closed:0:%u", ++id(action_seq)));
+            - lvgl.page.show: main_page
+            - lvgl.resume:
+            - script.execute: lower_catcher
 
   - id: wake_screen
     then:
@@ -503,6 +569,11 @@ touchscreen:
           ESP_LOGI("touch", "touch x=%d y=%d (raw %d,%d)", touch.x, touch.y, touch.x_raw, touch.y_raw);
       - if:
           condition:
+            lambda: return id(image_mode);
+          then:
+            - script.execute: image_exit
+      - if:
+          condition:
             lambda: return id(awake_until) == 0 && id(base_level) < 0.35f;
           then:
             - script.execute: wake_screen
@@ -547,16 +618,16 @@ lvgl:
   default_font: montserrat_14
   style_definitions:
     - id: card_style
-      bg_color: 0x1c150e
+      bg_color: 0x16271e
       bg_opa: COVER
-      border_color: 0x6b5637
+      border_color: 0x4d6650
       border_width: 2
       radius: 4
       pad_all: 4
     - id: side_btn_style
-      bg_color: 0x1c150e
+      bg_color: 0x16271e
       bg_opa: COVER
-      border_color: 0x6b5637
+      border_color: 0x4d6650
       border_width: 2
       radius: 4
       shadow_width: 0
@@ -565,13 +636,13 @@ lvgl:
       # release don't land on the same object - text-sized buttons lost most taps.
       bg_opa: TRANSP
       border_width: 1
-      border_color: 0x6b5637
+      border_color: 0x4d6650
       radius: 3
       shadow_width: 0
       pad_all: 0
   pages:
     - id: main_page
-      bg_color: 0x0b0906
+      bg_color: 0x0e1a14
       scrollable: false
       widgets:
         # ---- status bar
@@ -580,21 +651,21 @@ lvgl:
             x: 6
             y: 3
             text: "--:--"
-            text_color: 0xe8ddc7
+            text_color: 0xece4d0
         - label:
             id: utc_label
             x: 50
             y: 5
             text: "--:-- UTC"
             text_font: montserrat_12
-            text_color: 0xa08f6f
+            text_color: 0xa9b096
         - label:
             id: briefing_label
             x: 222
             y: 3
             width: 22
             text: ""
-            text_color: 0xa08f6f
+            text_color: 0xa9b096
         - label:
             id: status_label
             x: 130
@@ -603,7 +674,7 @@ lvgl:
             text_align: RIGHT
             text_font: mdi_14
             text: ""
-            text_color: 0xa08f6f
+            text_color: 0xa9b096
         - label:
             id: health_label          # LLM health - hidden unless something needs a look
             x: 114
@@ -631,7 +702,7 @@ lvgl:
             width: 236
             text_align: CENTER
             text: "Nothing waiting on you."
-            text_color: 0xa08f6f
+            text_color: 0xa9b096
 
         # ---- three notification cards
         - obj:
@@ -645,7 +716,7 @@ lvgl:
             scrollable: false
             widgets:
               - label: {id: card0_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
-              - label: {id: card0_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - label: {id: card0_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xece4d0}
               - button:
                   id: card0_ack
                   styles: small_btn_style
@@ -675,7 +746,7 @@ lvgl:
             scrollable: false
             widgets:
               - label: {id: card1_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
-              - label: {id: card1_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - label: {id: card1_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xece4d0}
               - button:
                   id: card1_ack
                   styles: small_btn_style
@@ -705,7 +776,7 @@ lvgl:
             scrollable: false
             widgets:
               - label: {id: card2_tier, x: 0, y: 0, text: "", text_font: montserrat_12}
-              - label: {id: card2_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xe8ddc7}
+              - label: {id: card2_title, x: 24, y: 0, width: 200, height: 34, long_mode: DOT, text: "", text_color: 0xece4d0}
               - button:
                   id: card2_ack
                   styles: small_btn_style
@@ -741,7 +812,7 @@ lvgl:
             width: 66
             height: 72
             widgets:
-              - label: {id: btn_stand_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CE1", text_color: 0xe8ddc7}
+              - label: {id: btn_stand_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CE1", text_color: 0xece4d0}
             on_click:
               - homeassistant.action:
                   action: script.setdeskstanding
@@ -754,7 +825,7 @@ lvgl:
             height: 72
             checkable: true
             widgets:
-              - label: {id: btn_lamp_icon, align: CENTER, text_font: mdi_36, text: "\U000F06B5", text_color: 0xe8ddc7}
+              - label: {id: btn_lamp_icon, align: CENTER, text_font: mdi_36, text: "\U000F06B5", text_color: 0xece4d0}
             on_click:
               - homeassistant.action:
                   action: light.toggle
@@ -768,7 +839,7 @@ lvgl:
             width: 66
             height: 72
             widgets:
-              - label: {id: btn_sit_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CDB", text_color: 0xe8ddc7}
+              - label: {id: btn_sit_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CDB", text_color: 0xece4d0}
             on_click:
               - homeassistant.action:
                   action: script.setdesksitting
@@ -794,10 +865,10 @@ lvgl:
     # ---- the LLM page: Feather's model, GPU and speeds (set_llm). Opened from the status bar,
     # back to the notifications on Back or after 30 s (show_llm_page).
     - id: llm_page
-      bg_color: 0x0b0906
+      bg_color: 0x0e1a14
       scrollable: false
       widgets:
-        - label: {id: llm_title, x: 6, y: 8, text: "LLM", text_color: 0xe8ddc7}
+        - label: {id: llm_title, x: 6, y: 8, text: "LLM", text_color: 0xece4d0}
         - button:
             id: llm_back
             styles: side_btn_style
@@ -806,11 +877,11 @@ lvgl:
             width: 88
             height: 30
             widgets:
-              - label: {id: llm_back_label, align: CENTER, text: "Back", text_color: 0xe8ddc7}
+              - label: {id: llm_back_label, align: CENTER, text: "Back", text_color: 0xece4d0}
             on_click:
               - script.stop: show_llm_page
               - lvgl.page.show: main_page
-        - label: {id: llm_model, x: 6, y: 40, width: 308, long_mode: DOT, text: "waiting for Feather", text_color: 0xe8ddc7}
+        - label: {id: llm_model, x: 6, y: 40, width: 308, long_mode: DOT, text: "waiting for Feather", text_color: 0xece4d0}
         - bar:
             id: llm_vram_bar
             x: 6
@@ -820,19 +891,19 @@ lvgl:
             min_value: 0
             max_value: 100
             value: 0
-            bg_color: 0x1c150e
+            bg_color: 0x16271e
             radius: 3
             indicator:
-              bg_color: 0xc9a24b
+              bg_color: 0xd4a95a
               radius: 3
-        - label: {id: llm_vram, x: 204, y: 63, width: 110, text: "-", text_color: 0xe8ddc7}
-        - label: {id: llm_gpu, x: 6, y: 88, width: 308, long_mode: DOT, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_vram, x: 204, y: 63, width: 110, text: "-", text_color: 0xece4d0}
+        - label: {id: llm_gpu, x: 6, y: 88, width: 308, long_mode: DOT, text: "-", text_color: 0xece4d0}
         - label: {id: llm_reason, x: 6, y: 110, width: 308, long_mode: DOT, text: "", hidden: true}
-        - label: {id: llm_gen_cap, x: 6, y: 136, text: "Generation", text_color: 0xa08f6f}
-        - label: {id: llm_gen, x: 112, y: 136, width: 202, text: "-", text_color: 0xe8ddc7}
-        - label: {id: llm_prefill_cap, x: 6, y: 160, text: "Prefill (cold)", text_color: 0xa08f6f}
-        - label: {id: llm_prefill, x: 112, y: 160, width: 202, text: "-", text_color: 0xe8ddc7}
-        - label: {id: llm_reuse_cap, x: 6, y: 184, text: "Cache reuse", text_color: 0xa08f6f}
-        - label: {id: llm_reuse, x: 112, y: 184, width: 202, text: "-", text_color: 0xe8ddc7}
-        - label: {id: llm_turns_cap, x: 6, y: 208, text: "Last turn", text_color: 0xa08f6f}
-        - label: {id: llm_turns, x: 112, y: 208, width: 202, text: "-", text_color: 0xe8ddc7}
+        - label: {id: llm_gen_cap, x: 6, y: 136, text: "Generation", text_color: 0xa9b096}
+        - label: {id: llm_gen, x: 112, y: 136, width: 202, text: "-", text_color: 0xece4d0}
+        - label: {id: llm_prefill_cap, x: 6, y: 160, text: "Prefill (cold)", text_color: 0xa9b096}
+        - label: {id: llm_prefill, x: 112, y: 160, width: 202, text: "-", text_color: 0xece4d0}
+        - label: {id: llm_reuse_cap, x: 6, y: 184, text: "Cache reuse", text_color: 0xa9b096}
+        - label: {id: llm_reuse, x: 112, y: 184, width: 202, text: "-", text_color: 0xece4d0}
+        - label: {id: llm_turns_cap, x: 6, y: 208, text: "Last turn", text_color: 0xa9b096}
+        - label: {id: llm_turns, x: 112, y: 208, width: 202, text: "-", text_color: 0xece4d0}
