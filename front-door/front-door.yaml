@@ -1,0 +1,758 @@
+# ============================================================
+# Front door - Elecrow CrowPanel Advance 7.0" (DIS02170A, hardware V1.3), ESP32-S3 N16R8.
+# 800x480 RGB panel, GT911 touch. Hangs by the front door.
+#
+# BEHAVIOUR (user's spec, 2026-10-25):
+#   - Idle: dashboard (today's weather, today's family calendar, who's home), backlight OFF.
+#   - Tap: backlight on for 30 s (each tap restarts the 30 s).
+#   - Doorbell pressed: the Aqara door camera full screen, backlight on, for 60 s.
+# Everything comes from Home Assistant over the native API - HA must have this device added
+# with "Allow the device to perform Home Assistant actions" ticked (forecast + calendar are
+# fetched with response-returning actions).
+#   Doorbell  event.doorbell_repeater_817d_video_doorbell (Aqara, HomeKit; state = last ring time)
+#   Camera    camera.aqara (Frigate) - JPEG stills via HA's camera_proxy, resized by HA to 800 px
+#   Weather   weather.edmonton_forecast (Environment Canada)
+#   Calendar  Feather's calendar directory: family = plambeck_house + Jen's Hotmail; reference =
+#             waste pickup, birthdays, holidays. Personal calendars stay off a door screen.
+#   Home      person.* (michael, jennifer, sam, eli, emilia, iris)
+#
+# Previous attempt: ../CrowPanel_DIS02170A.yaml - keep it for its investigation log. Its
+# display/PSRAM/framework settings are reused here unchanged (they gave a working image).
+#
+# BOARD QUIRKS (V1.3) - the helper MCU, not the ESP32, owns the backlight and touch reset:
+#   I2C 15/16: 0x30 = STC8H1K28 helper MCU, 0x5D = GT911 touch, 0x51 = PCF8563 RTC.
+#   STC8 takes single-byte commands: 0 = brightest ... 244 = dimmest, 245 = backlight off,
+#   246/247 = buzzer on/off, 250 = activate (un-reset) the touch screen.
+#   Touch bring-up, from Elecrow's own V1.3 Arduino code (lesson-03 BigInch_LVGL.ino):
+#   send 250, hold GPIO1 (GT911 INT) low 120 ms, release it, wait 100 ms, repeat until 0x5D
+#   answers - THEN set the backlight. The old attempts sent 0x10 (= brightness 16) and never 250.
+#
+# Logs: USB-C goes through a CH340 to UART0, not the S3's own USB - hence hardware_uart: UART0.
+# ESPHome 2025.12.0 (same scratch-venv version as feather-cyd).
+# ============================================================
+
+esphome:
+  name: front-door
+  friendly_name: Front Door
+  platformio_options:
+    build_flags: "-DBOARD_HAS_PSRAM"
+    board_build.esp-idf.memory_type: qio_opi
+    board_build.flash_mode: dio
+  includes:
+    - front_door_helpers.h
+  on_boot:
+    # 700: after the I2C bus (BUS, 1000), before the touchscreen (DATA, 600) - the boot log shows
+    # touchscreen setting up right after psram, so the old YAML's 500 ran too late.
+    priority: 700.0
+    then:
+      - lambda: |-
+          // Probe by 1-byte read: a zero-length write hung the boot here (2026-10-25).
+          auto probe = [](uint8_t addr) {
+            uint8_t b = 0;
+            return id(bus_a).read(addr, &b, 1) == i2c::ERROR_OK;
+          };
+          ESP_LOGI("front_door", "touch bring-up start: 0x30 %d, 0x5D %d, 0x14 %d", probe(0x30), probe(0x5D), probe(0x14));
+          // Backlight on first - the old YAML only ever saw the GT911 after a backlight command.
+          uint8_t bl = 0;
+          id(bus_a).write(0x30, &bl, 1);
+          delay(300);
+          App.feed_wdt();
+          ESP_LOGI("front_door", "after backlight on: 0x5D %d, 0x14 %d", probe(0x5D), probe(0x14));
+          bool ok = false;
+          for (int attempt = 1; attempt <= 6 && !ok; attempt++) {
+            if (probe(0x5D) || probe(0x14)) { ok = true; break; }
+            uint8_t cmd = 250;  // activate touch screen
+            id(bus_a).write(0x30, &cmd, 1);
+            gpio_set_direction(GPIO_NUM_1, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_1, 0);
+            delay(120);
+            gpio_set_direction(GPIO_NUM_1, GPIO_MODE_INPUT);
+            delay(100);
+            App.feed_wdt();
+            ESP_LOGI("front_door", "touch bring-up attempt %d", attempt);
+          }
+          ESP_LOGI("front_door", "GT911 %s (0x5D %d, 0x14 %d)", ok ? "found" : "NOT found", probe(0x5D), probe(0x14));
+          id(touch_found) = ok;
+      - script.execute: apply_backlight
+
+esp32:
+  board: esp32-s3-devkitc-1
+  # The N16R8 has 16 MB; the default layout uses 4. Changing this needs a USB flash, not OTA.
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: UART0
+
+api:
+  encryption:
+    key: !secret api_key
+  # HA (re)connected: fetch today's forecast + calendar once it has subscribed to our actions.
+  on_client_connected:
+    - delay: 5s
+    - script.execute: refresh_today
+    - script.execute: update_home
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# No manual_ip - see the old YAML (a wrong static IP once broke OTA on this board).
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Front Door Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Edmonton
+    on_time:
+      # New day: today's forecast and calendar.
+      - seconds: 0
+        minutes: 1
+        hours: 0
+        then:
+          - script.execute: refresh_today
+
+http_request:
+  verify_ssl: false
+  timeout: 5s
+
+globals:
+  - id: touch_found
+    type: bool
+    initial_value: "false"
+  # Backlight levels in %. (New ids, so the old 20 % idle setting isn't restored over the new default.)
+  - id: idle_level
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: wake_level
+    type: int
+    restore_value: true
+    initial_value: "60"
+  - id: camera_level
+    type: int
+    restore_value: true
+    initial_value: "100"
+  - id: camera_active
+    type: bool
+    initial_value: "false"
+  - id: awake
+    type: bool
+    initial_value: "false"
+  - id: lit_at
+    type: uint32_t
+    initial_value: "0"
+  # Last doorbell event time seen - a ring is a CHANGE from this, so (re)connecting to HA,
+  # which replays the current state, never counts as a ring.
+  - id: last_ring
+    type: std::string
+    initial_value: '""'
+
+# scan: false - the old YAML found the built-in scan locks the bus on this board.
+i2c:
+  sda: 15
+  scl: 16
+  scan: false
+  id: bus_a
+
+# Touch: the GT911 was missing from the bus until 2026-10-25, when the touch ribbon's connector
+# latch turned out to be open - that, not software, was why the old YAML's 11 attempts failed.
+# If touch ever dies again, check the latch first. A configured gt911 that is missing from the bus
+# fails its setup and blocks boot before LVGL/Wi-Fi (blank screen, no network).
+touchscreen:
+  - platform: gt911
+    id: touch
+    i2c_id: bus_a
+    address: 0x5D
+    update_interval: 16ms
+    calibration:
+      x_min: 0
+      x_max: 800
+      y_min: 0
+      y_max: 480
+    on_touch:
+      - if:
+          condition:
+            lambda: return id(camera_active);
+          then:
+            - script.stop: show_camera
+            - script.execute: close_camera
+          else:
+            - lambda: if (!id(awake)) id(lit_at) = millis();
+            - script.execute: wake
+
+display:
+  - platform: rpi_dpi_rgb
+    id: main_display
+    color_order: RGB
+    invert_colors: true
+    update_interval: never
+    auto_clear_enabled: false
+    dimensions:
+      width: 800
+      height: 480
+    de_pin: 42
+    hsync_pin: 40
+    vsync_pin: 41
+    pclk_pin: 39
+    pclk_frequency: 20MHz
+    hsync_pulse_width: 4
+    hsync_front_porch: 8
+    hsync_back_porch: 8
+    vsync_pulse_width: 4
+    vsync_front_porch: 8
+    vsync_back_porch: 8
+    data_pins:
+      red: [7, 17, 18, 3, 46]
+      green: [9, 10, 11, 12, 13, 14]
+      blue: [21, 47, 48, 45, 38]
+
+# Weather icons (Material Design Icons) - only the glyphs used below are built in.
+font:
+  - file:
+      type: web
+      url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
+    id: mdi_weather
+    size: 120
+    glyphs: [
+      "\U000F0599", "\U000F0594", "\U000F0595", "\U000F0590", "\U000F0591", "\U000F0592",
+      "\U000F0593", "\U000F067E", "\U000F0596", "\U000F0597", "\U000F0598", "\U000F067F",
+      "\U000F059D", "\U000F05D6"]
+  - file:
+      type: web
+      url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
+    id: mdi_small
+    size: 36
+    glyphs: ["\U000F0100"]
+
+# ---- Home Assistant inputs --------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: doorbell_event
+    entity_id: event.doorbell_repeater_817d_video_doorbell
+    internal: true
+    on_value:
+      - lambda: |-
+          if (x.empty() || x == "unknown" || x == "unavailable") return;
+          bool first = id(last_ring).empty();
+          bool changed = x != id(last_ring);
+          id(last_ring) = x;
+          if (!first && changed) id(doorbell_ring).execute();
+  - platform: homeassistant
+    id: cam_picture
+    entity_id: camera.aqara
+    attribute: entity_picture
+    internal: true
+  - platform: homeassistant
+    id: weather_now
+    entity_id: weather.edmonton_forecast
+    internal: true
+    on_value:
+      - script.execute: update_header
+  - platform: homeassistant
+    id: p_michael
+    entity_id: person.michael
+    internal: true
+    on_value: {script.execute: update_home}
+  - platform: homeassistant
+    id: p_jennifer
+    entity_id: person.jennifer
+    internal: true
+    on_value: {script.execute: update_home}
+  - platform: homeassistant
+    id: p_sam
+    entity_id: person.sam
+    internal: true
+    on_value: {script.execute: update_home}
+  - platform: homeassistant
+    id: p_eli
+    entity_id: person.eli
+    internal: true
+    on_value: {script.execute: update_home}
+  - platform: homeassistant
+    id: p_emilia
+    entity_id: person.emilia
+    internal: true
+    on_value: {script.execute: update_home}
+  - platform: homeassistant
+    id: p_iris
+    entity_id: person.iris
+    internal: true
+    on_value: {script.execute: update_home}
+
+sensor:
+  - platform: homeassistant
+    id: temp_now
+    entity_id: weather.edmonton_forecast
+    attribute: temperature
+    internal: true
+    on_value:
+      - script.execute: update_header
+
+# ---- Door camera ------------------------------------------------------------------------------
+# A still every ~second while the camera page is up. HA scales it to 800 px wide (camera_proxy's
+# width parameter), so the S3 never decodes a full-size frame.
+online_image:
+  - id: door_cam
+    url: "http://10.10.10.201:8123/"
+    format: JPEG
+    type: RGB565
+    # ESPHome's JPEG decode costs ~8 us per SOURCE pixel (double maths on a single-precision FPU):
+    # the full 1280x720 Frigate still took ~7 s. So ask HA for a small frame - this camera only
+    # scales when given BOTH width and height (width alone is ignored).
+    resize: 640x360
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update:
+          id: cam_img
+          src: door_cam
+      - script.execute: cam_next
+    on_error:
+      - script.execute: cam_next
+
+# ---- Behaviour --------------------------------------------------------------------------------
+script:
+  # 0 % = backlight off (245); 1..100 % maps onto 244 (dimmest)..0 (brightest).
+  - id: apply_backlight
+    then:
+      - lambda: |-
+          int pct = id(camera_active) ? id(camera_level) : (id(awake) ? id(wake_level) : id(idle_level));
+          uint8_t cmd = pct <= 0 ? 245 : (uint8_t)(244 - (min(pct, 100) - 1) * 244 / 99);
+          id(bus_a).write(0x30, &cmd, 1);
+
+  # Tap: on for 30 s; another tap restarts the 30 s.
+  - id: wake
+    mode: restart
+    then:
+      - lambda: id(awake) = true;
+      - script.execute: apply_backlight
+      - delay: 30s
+      - lambda: id(awake) = false;
+      - script.execute: apply_backlight
+
+  # Doorbell: the camera, full screen and lit, for 60 s; a second ring restarts the 60 s.
+  # Camera full screen and lit for `seconds` (doorbell 60, the camera button 30); calling it
+  # again restarts the time; a tap on it closes it early.
+  - id: show_camera
+    mode: restart
+    parameters:
+      seconds: int
+    then:
+      - logger.log:
+          format: "camera view for %d s"
+          args: [seconds]
+      - script.stop: wake
+      - lambda: |-
+          id(awake) = false;
+          id(camera_active) = true;
+      - lvgl.page.show: cam_page
+      - script.execute: apply_backlight
+      - script.execute: cam_fetch
+      - delay: !lambda return seconds * 1000;
+      - script.execute: close_camera
+
+  - id: close_camera
+    then:
+      - lambda: id(camera_active) = false;
+      - lvgl.page.show: dash_page
+      - script.execute: apply_backlight
+      - online_image.release: door_cam
+
+  - id: doorbell_ring
+    then:
+      - script.execute:
+          id: show_camera
+          seconds: 60
+
+  - id: cam_fetch
+    then:
+      - if:
+          condition:
+            lambda: return id(camera_active) && !id(cam_picture).state.empty();
+          then:
+            - online_image.set_url:
+                id: door_cam
+                url: !lambda |-
+                  return "http://10.10.10.201:8123" + id(cam_picture).state + "&width=640&height=360";
+            - component.update: door_cam
+
+  # The panel can't read touch while it decodes a frame (~1.7 s), so leave a long-ish gap between
+  # frames - otherwise a quick tap to close the camera is usually missed.
+  - id: cam_next
+    mode: single
+    then:
+      - delay: 1200ms
+      - script.execute: cam_fetch
+
+  # Header: clock, date, current temperature + condition.
+  - id: update_header
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) {
+            int h = now.hour % 12; if (h == 0) h = 12;
+            char t[16]; snprintf(t, sizeof(t), "%d:%02d %s", h, now.minute, now.hour < 12 ? "AM" : "PM");
+            lv_label_set_text(id(clock_label), t);
+            lv_label_set_text(id(date_label), now.strftime("%A, %B %d").c_str());
+          }
+          std::string s;
+          if (id(temp_now).has_state() && !std::isnan(id(temp_now).state)) {
+            char b[16]; snprintf(b, sizeof(b), "%.0f°", id(temp_now).state); s = b;
+          }
+          lv_label_set_text(id(temp_now_label), s.c_str());
+          lv_label_set_text(id(cond_now_label), cond_text(id(weather_now).state).c_str());
+
+  # "Home:" bar along the bottom - person.* states as HA defines them.
+  - id: update_home
+    then:
+      - lambda: |-
+          struct P { text_sensor::TextSensor *s; const char *name; };
+          P people[] = {{id(p_michael), "Michael"}, {id(p_jennifer), "Jennifer"}, {id(p_sam), "Sam"},
+                        {id(p_eli), "Eli"}, {id(p_emilia), "Emy"}, {id(p_iris), "Iris"}};
+          std::string out;
+          for (auto &p : people) {
+            if (p.s->state != "home") continue;
+            if (!out.empty()) out += "   •   ";
+            out += p.name;
+          }
+          lv_label_set_text(id(home_label), out.empty() ? "Nobody home" : out.c_str());
+
+  # Today's forecast and calendar - response-returning HA actions; the response_template runs in
+  # HA and hands back a small JSON object.
+  - id: refresh_today
+    then:
+      - homeassistant.action:
+          action: weather.get_forecasts
+          data:
+            entity_id: weather.edmonton_forecast
+            type: daily
+          capture_response: true
+          response_template: |-
+            {%- set f = response['weather.edmonton_forecast'].forecast[0] -%}
+            {{ {'cond': f.condition, 'hi': f.temperature, 'lo': f.templow,
+                'pop': f.precipitation_probability} | tojson }}
+          on_success:
+            - lambda: |-
+                JsonDocument unwrapped;
+                JsonObjectConst r = front_door_unwrap(response, unwrapped, "forecast");
+                std::string cond = r["cond"] | "";
+                std::string line;
+                char b[48];
+                if (!r["hi"].isNull()) { snprintf(b, sizeof(b), "High %.0f°", r["hi"].as<float>()); line = b; }
+                else line = "Tonight";
+                if (!r["lo"].isNull()) { snprintf(b, sizeof(b), "   Low %.0f°", r["lo"].as<float>()); line += b; }
+                lv_label_set_text(id(fc_icon), cond_icon(cond).c_str());
+                lv_label_set_text(id(fc_cond), cond_text(cond).c_str());
+                lv_label_set_text(id(fc_temps), line.c_str());
+                int pop = r["pop"] | -1;
+                if (pop >= 0) { snprintf(b, sizeof(b), "Precipitation %d%%", pop); lv_label_set_text(id(fc_pop), b); }
+                else lv_label_set_text(id(fc_pop), "");
+          on_error:
+            - logger.log:
+                format: "forecast failed: %s"
+                args: [error.c_str()]
+      - homeassistant.action:
+          action: calendar.get_events
+          data:
+            entity_id: calendar.plambeck_house,calendar.gi_jen007_hotmail_com,calendar.ics,calendar.birthdays,calendar.holidays_in_canada,calendar.canada_ab
+          data_template:
+            start_date_time: "{{ today_at('00:00') }}"
+            end_date_time: "{{ today_at('00:00') + timedelta(days=1) }}"
+          capture_response: true
+          response_template: |-
+            {%- set ns = namespace(rows=[]) -%}
+            {%- for cal, v in response.items() -%}{%- for e in v.events -%}
+            {%- if 'T' in e.start -%}
+            {%- set t = as_datetime(e.start) | as_local -%}
+            {%- set key = t.strftime('%H%M') -%}
+            {%- set when = t.strftime('%I:%M %p') | regex_replace('^0', '') -%}
+            {%- else -%}
+            {%- set key = '0000' -%}{%- set when = 'All day' -%}
+            {%- endif -%}
+            {%- set title = e.summary | regex_replace('[^\\x20-\\x7E]', '') | trim -%}
+            {%- set ns.rows = ns.rows + [key ~ '|' ~ when ~ '|' ~ title[:44]] -%}
+            {%- endfor -%}{%- endfor -%}
+            {%- set out = namespace(lines=[]) -%}
+            {%- for r in ns.rows | unique | sort -%}
+            {%- set p = r.split('|') -%}
+            {%- set out.lines = out.lines + [p[1] ~ '   ' ~ p[2]] -%}
+            {%- endfor -%}
+            {{ {'text': out.lines[:8] | join('\n'), 'count': out.lines | count} | tojson }}
+          on_success:
+            - lambda: |-
+                JsonDocument unwrapped;
+                JsonObjectConst r = front_door_unwrap(response, unwrapped, "calendar");
+                std::string text = r["text"] | "";
+                int count = r["count"] | 0;
+                if (count > 8) text += "\n+ " + to_string(count - 8) + " more";
+                lv_label_set_text(id(cal_label), count == 0 ? "Nothing on the calendar today." : text.c_str());
+          on_error:
+            - logger.log:
+                format: "calendar failed: %s"
+                args: [error.c_str()]
+
+number:
+  - platform: template
+    name: "Idle Backlight"
+    min_value: 0
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    entity_category: config
+    lambda: return id(idle_level);
+    set_action:
+      - lambda: id(idle_level) = (int)x;
+      - script.execute: apply_backlight
+  - platform: template
+    name: "Tap Backlight"
+    min_value: 5
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    entity_category: config
+    lambda: return id(wake_level);
+    set_action:
+      - lambda: id(wake_level) = (int)x;
+      - script.execute: apply_backlight
+  - platform: template
+    name: "Camera Backlight"
+    min_value: 5
+    max_value: 100
+    step: 5
+    unit_of_measurement: "%"
+    entity_category: config
+    lambda: return id(camera_level);
+    set_action:
+      - lambda: id(camera_level) = (int)x;
+      - script.execute: apply_backlight
+
+button:
+  # Try the doorbell view without anyone at the door.
+  - platform: template
+    name: "Test Doorbell View"
+    on_press:
+      - script.execute: doorbell_ring
+  - platform: template
+    name: "Refresh Today"
+    on_press:
+      - script.execute: refresh_today
+
+binary_sensor:
+  - platform: template
+    name: "Touch Found"
+    lambda: return id(touch_found);
+    entity_category: diagnostic
+
+# ---- Screen -----------------------------------------------------------------------------------
+lvgl:
+  log_level: WARN
+  color_depth: 16
+  bg_color: 0x16211A
+  text_font: montserrat_28
+  text_color: 0xE8E2D0
+  touchscreens:
+    - touch
+  pages:
+    - id: dash_page
+      bg_color: 0x16211A
+      widgets:
+        # Header: time + date (left), now temperature + condition (right).
+        - label:
+            id: clock_label
+            x: 32
+            y: 18
+            text_font: montserrat_48
+            text: "--:--"
+        - label:
+            id: date_label
+            x: 34
+            y: 80
+            text_font: montserrat_24
+            text_color: 0xC9B27C
+            text: ""
+        - label:
+            id: temp_now_label
+            align: TOP_RIGHT
+            x: -32
+            y: 18
+            text_font: montserrat_48
+            text: ""
+        - label:
+            id: cond_now_label
+            align: TOP_RIGHT
+            x: -34
+            y: 80
+            text_font: montserrat_24
+            text_color: 0xC9B27C
+            text: ""
+        # Today's forecast (left card).
+        - obj:
+            x: 24
+            y: 124
+            width: 280
+            height: 268
+            bg_color: 0x22322A
+            border_width: 0
+            text_color: 0xE8E2D0
+            radius: 14
+            pad_all: 14
+            scrollable: false
+            widgets:
+              - label:
+                  align: TOP_LEFT
+                  text_font: montserrat_20
+                  text_color: 0xC9B27C
+                  text: "TODAY"
+              - label:
+                  id: fc_icon
+                  align: TOP_MID
+                  y: 22
+                  text_font: mdi_weather
+                  text_color: 0xE8E2D0
+                  text: ""
+              - label:
+                  id: fc_cond
+                  align: TOP_MID
+                  y: 146
+                  text_font: montserrat_24
+                  text: ""
+              - label:
+                  id: fc_temps
+                  align: TOP_MID
+                  y: 180
+                  text_font: montserrat_22
+                  text: ""
+              - label:
+                  id: fc_pop
+                  align: TOP_MID
+                  y: 212
+                  text_font: montserrat_18
+                  text_color: 0xA9B8A0
+                  text: ""
+        # Today's calendar (right card).
+        - obj:
+            x: 320
+            y: 124
+            width: 456
+            height: 268
+            bg_color: 0x22322A
+            border_width: 0
+            text_color: 0xE8E2D0
+            radius: 14
+            pad_all: 14
+            scrollable: false
+            widgets:
+              - label:
+                  align: TOP_LEFT
+                  text_font: montserrat_20
+                  text_color: 0xC9B27C
+                  text: "CALENDAR"
+              - label:
+                  id: cal_label
+                  x: 0
+                  y: 30
+                  width: 428
+                  long_mode: DOT
+                  height: 210
+                  text_font: montserrat_22
+                  text: "Loading..."
+        # Who's home (bottom bar).
+        - obj:
+            align: BOTTOM_MID
+            width: 800
+            height: 72
+            bg_color: 0x0F1712
+            border_width: 0
+            text_color: 0xE8E2D0
+            radius: 0
+            scrollable: false
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  x: 16
+                  text_font: montserrat_20
+                  text_color: 0xC9B27C
+                  text: "HOME"
+              - label:
+                  id: home_label
+                  align: LEFT_MID
+                  x: 100
+                  width: 560
+                  long_mode: DOT
+                  text_font: montserrat_26
+                  text: ""
+              - button:
+                  id: cam_button
+                  align: RIGHT_MID
+                  x: -12
+                  width: 110
+                  height: 56
+                  bg_color: 0x4A6B3A
+                  radius: 12
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text_font: mdi_small
+                        text_color: 0xE8E2D0
+                        text: "\U000F0100"
+                  on_click:
+                    # Ignore the tap that woke a dark screen.
+                    - if:
+                        condition:
+                          lambda: return millis() - id(lit_at) > 400;
+                        then:
+                          - script.execute:
+                              id: show_camera
+                              seconds: 30
+    - id: cam_page
+      bg_color: 0x000000
+      widgets:
+        - image:
+            id: cam_img
+            align: CENTER
+            src: door_cam
+        - label:
+            align: TOP_LEFT
+            x: 16
+            y: 12
+            text_font: montserrat_24
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 6
+            text: "Front door"
+        - label:
+            align: TOP_RIGHT
+            x: -16
+            y: 12
+            text_font: montserrat_24
+            text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 50%
+            pad_all: 6
+            text: "Tap to close"
+
+interval:
+  - interval: 10s
+    then:
+      - script.execute: update_header
+  - interval: 15min
+    then:
+      - script.execute: refresh_today
