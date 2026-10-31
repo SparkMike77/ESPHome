@@ -2,7 +2,8 @@
 # Schlafzimmer - Cheap Yellow Display (ESP32-2432S028, ILI9341 + XPT2046) as a Feather screen.
 #
 # Left: the Chronicle's notification list (Feather pushes it over the native API).
-# Right: three buttons that still go through Home Assistant - desk stand, ArmLight toggle, desk sit.
+# Right: desk stand, ArmLight toggle and desk sit, which go through Home Assistant, and Feather's
+# GPU mode toggle (lit = coding mode, greyed while switching; Feather decides, set_mode reports it).
 #
 # Feather drives this over ESPHome's native API, the same way Home Assistant does
 # (feather/gjallarhorn/cyd.py, aioesphomeapi). Home Assistant stays connected too, for the
@@ -118,6 +119,18 @@ api:
             id: llm_vram_bar
             value: !lambda return vram_pct;
         - script.execute: render_health
+
+    # Feather's GPU mode (feather/modes.py): 2 lights the button, busy greys it out.
+    - action: set_mode
+      variables:
+        mode: int
+        busy: bool
+      then:
+        - lambda: |-
+            if (mode == 2) lv_obj_add_state(id(btn_mode), LV_STATE_CHECKED);
+            else lv_obj_clear_state(id(btn_mode), LV_STATE_CHECKED);
+            if (busy) lv_obj_add_state(id(btn_mode), LV_STATE_DISABLED);
+            else lv_obj_clear_state(id(btn_mode), LV_STATE_DISABLED);
 
     # ---- pictures (feather/gjallarhorn/cyd.py show_image) ----------------------------------
     # Start: pause the touch UI and keep the screen lit for `seconds` (5-3600).
@@ -496,15 +509,17 @@ script:
           lv_obj_set_style_bg_color(id(llm_vram_bar), c(id(c_surface)), LV_PART_MAIN);
           lv_obj_set_style_bg_color(id(llm_vram_bar), c(id(c_accent)), LV_PART_INDICATOR);
           lv_obj_t *surfaces[] = {id(card0), id(card1), id(card2),
-                                  id(btn_stand), id(btn_lamp), id(btn_sit), id(llm_back)};
+                                  id(btn_stand), id(btn_lamp), id(btn_sit), id(btn_mode), id(llm_back)};
           for (auto *o : surfaces) {
             lv_obj_set_style_bg_color(o, c(id(c_surface)), LV_PART_MAIN);
             lv_obj_set_style_border_color(o, c(id(c_border)), LV_PART_MAIN);
           }
           lv_obj_set_style_bg_color(id(btn_lamp), c(id(c_accent)), LV_PART_MAIN | LV_STATE_CHECKED);
+          lv_obj_set_style_bg_color(id(btn_mode), c(id(c_accent)), LV_PART_MAIN | LV_STATE_CHECKED);
+          lv_obj_set_style_bg_color(id(btn_mode), c(id(c_border)), LV_PART_MAIN | LV_STATE_DISABLED);
           lv_obj_t *texts[] = {id(card0_title), id(card1_title), id(card2_title),
                                id(clock_label), id(btn_stand_icon), id(btn_lamp_icon),
-                               id(btn_sit_icon), id(llm_title), id(llm_model), id(llm_gpu), id(llm_vram),
+                               id(btn_sit_icon), id(btn_mode_icon), id(llm_title), id(llm_model), id(llm_gpu), id(llm_vram),
                                id(llm_gen), id(llm_prefill), id(llm_reuse), id(llm_turns), id(llm_back_label)};
           for (auto *o : texts) lv_obj_set_style_text_color(o, c(id(c_text)), LV_PART_MAIN);
           lv_obj_t *muted[] = {id(status_label), id(utc_label), id(briefing_label), id(empty_label), id(more_label),
@@ -613,7 +628,7 @@ font:
     id: mdi_36
     size: 36
     bpp: 4
-    glyphs: ["\U000F0CE1", "\U000F0CDB", "\U000F06B5"]   # arrow-up-bold-box, arrow-down-bold-box, lamp
+    glyphs: ["\U000F0CE1", "\U000F0CDB", "\U000F06B5", "\U000F0174"]   # arrow-up-bold-box, arrow-down-bold-box, lamp, code-tags
   - file:
       type: web
       url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
@@ -822,14 +837,14 @@ lvgl:
             text_font: montserrat_12
             hidden: true
 
-        # ---- the side column: desk stand / ArmLight / desk sit - all through Home Assistant
+        # ---- the side column: desk stand / ArmLight / desk sit through Home Assistant, then GPU mode
         - button:
             id: btn_stand
             styles: side_btn_style
             x: 250
             y: 6
             width: 66
-            height: 72
+            height: 54
             widgets:
               - label: {id: btn_stand_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CE1", text_color: 0xece4d0}
             on_click:
@@ -839,9 +854,9 @@ lvgl:
             id: btn_lamp
             styles: side_btn_style
             x: 250
-            y: 84
+            y: 64
             width: 66
-            height: 72
+            height: 54
             checkable: true
             widgets:
               - label: {id: btn_lamp_icon, align: CENTER, text_font: mdi_36, text: "\U000F06B5", text_color: 0xece4d0}
@@ -854,14 +869,30 @@ lvgl:
             id: btn_sit
             styles: side_btn_style
             x: 250
-            y: 162
+            y: 122
             width: 66
-            height: 72
+            height: 54
             widgets:
               - label: {id: btn_sit_icon, align: CENTER, text_font: mdi_36, text: "\U000F0CDB", text_color: 0xece4d0}
             on_click:
               - homeassistant.action:
                   action: script.setdesksitting
+        # Not checkable: only set_mode lights it, so it can't disagree with what Feather is running.
+        - button:
+            id: btn_mode
+            styles: side_btn_style
+            x: 250
+            y: 180
+            width: 66
+            height: 54
+            widgets:
+              - label: {id: btn_mode_icon, align: CENTER, text_font: mdi_36, text: "\U000F0174", text_color: 0xece4d0}
+            on_click:
+              - lambda: |-
+                  // The touch panel can read noise while it starts up - same guard as the cards.
+                  if (millis() < 15000) return;
+                  id(feather_action).publish_state(str_sprintf("mode:0:%u", ++id(action_seq)));
+                  id(awake_until) = millis() + 30000;
 
         # ---- invisible full-screen catcher, only shown while the screen is dark/dim
         - obj:
