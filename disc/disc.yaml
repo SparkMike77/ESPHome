@@ -13,7 +13,8 @@
 #             -> NO built-in speaker: sound comes out of the 3.5 mm jack only
 #
 # Behaviour:
-#   - wake word on-device (microWakeWord: "Okay Nabu", "Hey Jarvis"), or tap the screen to talk
+#   - wake word on-device (microWakeWord: "Hey Jarvis", "Okay Nabu" - which one is active is
+#     HA's Wake word select, and the idle screen shows whichever is selected), or tap to talk
 #   - tap while it's talking/listening stops it; tap while a timer rings silences it
 #   - ring around the edge shows the phase: grey idle, blue listening, amber thinking,
 #     green replying, red error, dark red muted, purple timer ringing
@@ -122,6 +123,27 @@ globals:
   - id: timer_ringing
     type: bool
     initial_value: "false"
+  # Idle prompt, built from whichever wake word(s) HA's Wake word select has enabled.
+  - id: idle_prompt
+    type: std::string
+    initial_value: '"Tap to talk"'
+
+# HA enables/disables the on-device models through the satellite configuration with no
+# trigger for it, so check every 2 s and refresh the idle prompt when it changes.
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          std::string words;
+          for (auto *model : id(mww)->get_wake_words()) {
+            if (!model->is_enabled()) continue;
+            if (!words.empty()) words += "\" or \"";
+            words += model->get_wake_word();
+          }
+          std::string prompt = words.empty() ? std::string("Tap to talk") : "Say \"" + words + "\"";
+          if (prompt == id(idle_prompt)) return;
+          id(idle_prompt) = prompt;
+          if (id(current_phase) == "idle") lv_label_set_text(id(status_label), prompt.c_str());
 
 # --- AUDIO --------------------------------------------------------------------
 
@@ -390,7 +412,7 @@ script:
           id(current_phase) = phase;
           uint32_t color = 0x303030;
           const char *status = "";
-          if (phase == "idle")           { color = 0x303030; status = "Say \"Okay Nabu\""; }
+          if (phase == "idle")           { color = 0x303030; status = id(idle_prompt).c_str(); }
           else if (phase == "listening") { color = 0x2196F3; status = "Listening..."; }
           else if (phase == "thinking")  { color = 0xFFA000; status = "Thinking..."; }
           else if (phase == "replying")  { color = 0x4CAF50; status = ""; }
