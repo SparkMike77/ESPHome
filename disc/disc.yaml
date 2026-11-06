@@ -16,11 +16,17 @@
 #   - wake word on-device (microWakeWord: "Hey Jarvis", "Okay Nabu" - which one is active is
 #     HA's Wake word select, and the idle screen shows whichever is selected), or tap to talk
 #   - tap while it's talking/listening stops it; tap while a timer rings silences it
-#   - ring around the edge shows the phase: grey idle, blue listening, amber thinking,
-#     green replying, red error, dark red muted, purple timer ringing
+#   - screen is the centre disc of the Eye of Agamotto (the enclosure supplies the gold frame):
+#     listening = bands turn part-way and the eye opens (green stone), thinking = yellow pulse,
+#     replying = green, error = red, timer = purple; done = eye closes and bands turn back
+#   - "Show text" switch in HA: wake word prompt / clock / transcript over the eye, or off
 #   - screen dims after 2 min without activity
+#   - needs a solid USB supply: on the wireless/MagSafe puck it browns out (power-on reset) when
+#     a reply starts playing
 #
-# Build: esphome 2026.10.2 (see secrets.yaml next to this file, gitignored).
+# Build: esphome 2026.10.2 (see secrets.yaml next to this file, gitignored). Run
+# art/make_eye.py first - the eye frames it makes are gitignored, so a fresh clone won't build
+# without art/source/eye.png.
 
 substitutions:
   name: disc
@@ -58,6 +64,18 @@ logger:
 api:
   encryption:
     key: !secret api_key
+  actions:
+    # Spin the eye for 8 s without talking to it (HA: esphome.disc_eye_demo). For tuning the
+    # animation's frame time; harmless to leave in.
+    - action: eye_demo
+      then:
+        - script.execute:
+            id: set_phase
+            phase: "thinking"
+        - delay: 8s
+        - script.execute:
+            id: set_phase
+            phase: !lambda 'return id(mute).state ? std::string("muted") : std::string("idle");'
 
 ota:
   - platform: esphome
@@ -127,6 +145,15 @@ globals:
   - id: idle_prompt
     type: std::string
     initial_value: '"Tap to talk"'
+  # Eye animation targets, set per phase by set_phase and chased by the 33 ms frame player.
+  # eye_target: 0 = closed + bands aligned, 1 = bands turned + eye open.
+  # eye_variant (only shown once fully open): 0 green, 1 yellow pulse, 2 red, 3 purple.
+  - id: eye_target
+    type: float
+    initial_value: "0"
+  - id: eye_variant
+    type: int
+    initial_value: "0"
 
 # HA enables/disables the on-device models through the satellite configuration with no
 # trigger for it, so check every 2 s and refresh the idle prompt when it changes.
@@ -144,6 +171,41 @@ interval:
           if (prompt == id(idle_prompt)) return;
           id(idle_prompt) = prompt;
           if (id(current_phase) == "idle") lv_label_set_text(id(status_label), prompt.c_str());
+
+  # Eye of Agamotto frame player. Every frame is pre-rendered (art/make_eye.py) because the
+  # device took 120-225 ms to rotate layers itself; swapping a full-screen picture is cheap.
+  # Opening plays f00 -> f13 (bands turn, then lids part); closing plays it backwards. Once
+  # open, a colour variant can replace the last frame. Settled = no LVGL calls at all.
+  - interval: 33ms
+    then:
+      - lambda: |-
+          static image::Image *frames[] = {
+            id(eye_f00), id(eye_f01), id(eye_f02), id(eye_f03), id(eye_f04), id(eye_f05), id(eye_f06),
+            id(eye_f07), id(eye_f08), id(eye_f09), id(eye_f10), id(eye_f11), id(eye_f12), id(eye_f13)};
+          const int N = sizeof(frames) / sizeof(frames[0]);
+          static float t = 0;
+          static int shown = 0;             // 0..N-1 frame, 100+ = variant image
+          const float step = 0.033f / 0.55f;  // whole open/close takes ~0.55 s
+          float goal = id(eye_target);
+          if (t < goal) t = std::min(goal, t + step);
+          else if (t > goal) t = std::max(goal, t - step);
+          int want = (int) lroundf(t * (N - 1));
+          image::Image *src = frames[want];
+          if (want == N - 1 && id(eye_variant) != 0) {
+            switch (id(eye_variant)) {
+              case 1: {  // processing: alternate two yellows for a slow pulse
+                bool bright = (millis() / 600) % 2;
+                want = bright ? 102 : 101;
+                src = bright ? id(eye_yellow2) : id(eye_yellow);
+                break;
+              }
+              case 2: want = 103; src = id(eye_red); break;
+              case 3: want = 104; src = id(eye_purple); break;
+            }
+          }
+          if (want == shown) return;
+          lv_image_set_src(id(eye_w), src->get_lv_image_dsc());
+          shown = want;
 
 # --- AUDIO --------------------------------------------------------------------
 
@@ -199,8 +261,10 @@ media_player:
     id: disc_media
     name: Media player
     volume_increment: 0.05
-    volume_min: 0.4
-    volume_max: 0.9
+    # Capped at 50% output (HA's 100% = 0.5) to keep the reply-start power spike down on the
+    # wireless puck; raise volume_max if an external amp takes over the load.
+    volume_min: 0.2
+    volume_max: 0.5
     buffer_size: 250000
     announcement_pipeline:
       speaker: announcement_resampling_input
@@ -212,9 +276,9 @@ media_player:
       format: FLAC
       num_channels: 2
       sample_rate: 48000
+    # Wake chime removed (2026-11-06) so it doesn't stack on the wake-up power spike. To bring it
+    # back: add wake_word_triggered.flac here and play it in micro_wake_word's on_wake_word_detected.
     files:
-      - id: wake_sound
-        file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
       - id: timer_sound
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
 
@@ -246,13 +310,18 @@ switch:
           id: set_phase
           phase: "idle"
 
+  # Off = just the eye (prop look); on = wake word prompt, clock and transcript over it.
   - platform: template
-    id: wake_sound_enabled
-    name: Wake sound
-    icon: mdi:bullhorn
+    id: show_text
+    name: Show text
+    icon: mdi:format-text
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    on_state:
+      - script.execute:
+          id: set_phase
+          phase: !lambda return id(current_phase);
 
 # --- VOICE --------------------------------------------------------------------
 
@@ -264,13 +333,6 @@ micro_wake_word:
     - model: okay_nabu
     - model: hey_jarvis
   on_wake_word_detected:
-    - if:
-        condition:
-          switch.is_on: wake_sound_enabled
-        then:
-          - media_player.speaker.play_on_device_media_file:
-              media_file: wake_sound
-              announcement: true
     - voice_assistant.start:
         wake_word: !lambda return wake_word;
 
@@ -403,38 +465,52 @@ script:
           id: set_phase
           phase: !lambda 'return id(mute).state ? std::string("muted") : std::string("idle");'
 
-  # Ring colour + status text for each phase; any phase except idle/no_ha wakes the screen.
+  # Eye state + status text for each phase; any phase except idle/no_ha wakes the screen.
   - id: set_phase
     parameters:
       phase: string
     then:
       - lambda: |-
           id(current_phase) = phase;
-          uint32_t color = 0x303030;
           const char *status = "";
-          if (phase == "idle")           { color = 0x303030; status = id(idle_prompt).c_str(); }
-          else if (phase == "listening") { color = 0x2196F3; status = "Listening..."; }
-          else if (phase == "thinking")  { color = 0xFFA000; status = "Thinking..."; }
-          else if (phase == "replying")  { color = 0x4CAF50; status = ""; }
-          else if (phase == "error")     { color = 0xF44336; status = "Error"; }
-          else if (phase == "muted")     { color = 0x8B0000; status = "Muted"; }
-          else if (phase == "timer")     { color = 0xE040FB; status = "Timer! Tap to stop"; }
-          else if (phase == "no_ha")     { color = 0x555555; status = "Waiting for Home Assistant"; }
-          lv_obj_set_style_border_color(id(ring), lv_color_hex(color), LV_PART_MAIN);
+          float eye = 0;   // 0 closed/aligned, 1 open (see the frame player)
+          int variant = 0; // 0 green, 1 yellow pulse, 2 red, 3 purple
+          if (phase == "idle")           { status = id(idle_prompt).c_str(); }
+          else if (phase == "listening") { status = "Listening...";       eye = 1; }
+          else if (phase == "thinking")  { status = "Thinking...";        eye = 1; variant = 1; }
+          else if (phase == "replying")  { status = "";                   eye = 1; }
+          else if (phase == "error")     { status = "Error";              eye = 1; variant = 2; }
+          else if (phase == "muted")     { status = "Muted"; }
+          else if (phase == "timer")     { status = "Timer! Tap to stop"; eye = 1; variant = 3; }
+          else if (phase == "no_ha")     { status = "Connecting to HA..."; }
+          id(eye_target) = eye;
+          id(eye_variant) = variant;
           lv_label_set_text(id(status_label), status);
+          // Text off = pure prop look. Otherwise: status on top (hidden when empty); bottom slot
+          // is the clock while resting, transcript/reply while a conversation is on.
+          bool text = id(show_text).state;
+          bool resting = (phase == "idle" || phase == "muted" || phase == "no_ha");
+          if (resting) lv_label_set_text(id(text_label), "");
+          auto show = [](lv_obj_t *o, bool on) {
+            if (on) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+          };
+          show(id(status_label), text && status[0] != 0);
+          show(id(time_label), text && resting);
+          show(id(text_label), text && !resting);
       - if:
           condition:
             lambda: return id(current_phase) != "idle" && id(current_phase) != "no_ha";
           then:
             - script.execute: activity
 
-  # Full brightness now, dim after 2 minutes of nothing happening.
+  # Bright now, dim after 2 minutes of nothing happening. "Bright" is 75%, not 100%, to cut the
+  # wake-up power spike on the wireless puck (with the 50% volume cap and no wake chime).
   - id: activity
     mode: restart
     then:
       - light.turn_on:
           id: backlight
-          brightness: 100%
+          brightness: 75%
           transition_length: 200ms
       - delay: 120s
       - light.turn_on:
@@ -448,7 +524,6 @@ script:
           auto now = id(ha_time).now();
           if (!now.is_valid()) return;
           lv_label_set_text(id(time_label), now.strftime("%H:%M").c_str());
-          lv_label_set_text(id(date_label), now.strftime("%a %b %d").c_str());
 
 # --- DISPLAY + TOUCH ----------------------------------------------------------
 
@@ -527,17 +602,61 @@ font:
   - file:
       type: gfonts
       family: Roboto
-      weight: 300
-    id: font_time
-    size: 92
+      weight: 400
+    id: font_clock
+    size: 34
     glyphs: "0123456789:-"
   - file:
       type: gfonts
       family: Roboto
       weight: 400
     id: font_small
-    size: 22
+    size: 18
     glyphsets: [GF_Latin_Core]
+
+# Eye of Agamotto frames (centre disc only), pre-rendered by art/make_eye.py from
+# art/source/eye.png. Both folders are gitignored (third-party design; this repo is public) -
+# run the script before building. 18 x 259 KB of flash.
+image:
+  defaults:
+    type: RGB565
+  images:
+    - file: art/out/f00.png
+      id: eye_f00
+    - file: art/out/f01.png
+      id: eye_f01
+    - file: art/out/f02.png
+      id: eye_f02
+    - file: art/out/f03.png
+      id: eye_f03
+    - file: art/out/f04.png
+      id: eye_f04
+    - file: art/out/f05.png
+      id: eye_f05
+    - file: art/out/f06.png
+      id: eye_f06
+    - file: art/out/f07.png
+      id: eye_f07
+    - file: art/out/f08.png
+      id: eye_f08
+    - file: art/out/f09.png
+      id: eye_f09
+    - file: art/out/f10.png
+      id: eye_f10
+    - file: art/out/f11.png
+      id: eye_f11
+    - file: art/out/f12.png
+      id: eye_f12
+    - file: art/out/f13.png
+      id: eye_f13
+    - file: art/out/open_yellow.png
+      id: eye_yellow
+    - file: art/out/open_yellow2.png
+      id: eye_yellow2
+    - file: art/out/open_red.png
+      id: eye_red
+    - file: art/out/open_purple.png
+      id: eye_purple
 
 lvgl:
   displays: [main_display]
@@ -549,45 +668,55 @@ lvgl:
       bg_color: 0x000000
       scrollable: false
       widgets:
-        - obj:
-            id: ring
+        - image:
+            id: eye_w
+            src: eye_f00
             align: CENTER
-            width: 360
-            height: 360
-            radius: 180
-            bg_opa: TRANSP
-            border_width: 10
-            border_color: 0x555555
-            clickable: false
         - label:
             id: status_label
             align: TOP_MID
-            y: 62
+            y: 26
+            width: 200
+            long_mode: SCROLL_CIRCULAR
+            text_align: CENTER
             text_font: font_small
-            text_color: 0x9E9E9E
-            text: "Waiting for Home Assistant"
+            text_color: 0xE0E0E0
+            bg_color: 0x000000
+            bg_opa: 60%
+            radius: 10
+            pad_left: 8
+            pad_right: 8
+            pad_top: 2
+            pad_bottom: 2
+            text: "Connecting to HA..."
         - label:
             id: time_label
-            align: CENTER
-            y: -18
-            text_font: font_time
+            align: BOTTOM_MID
+            y: -22
+            text_font: font_clock
             text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 60%
+            radius: 10
+            pad_left: 8
+            pad_right: 8
+            pad_top: 2
+            pad_bottom: 2
             text: "--:--"
         - label:
-            id: date_label
-            align: CENTER
-            y: 42
-            text_font: font_small
-            text_color: 0xBDBDBD
-            text: ""
-        - label:
             id: text_label
-            align: TOP_MID
-            y: 238
-            width: 250
+            align: BOTTOM_MID
+            y: -20
+            width: 200
+            height: 44
             long_mode: DOT
-            height: 60
             text_align: CENTER
             text_font: font_small
             text_color: 0xFFFFFF
+            bg_color: 0x000000
+            bg_opa: 60%
+            radius: 10
+            pad_left: 8
+            pad_right: 8
+            hidden: true
             text: ""

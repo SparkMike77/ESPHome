@@ -3,3 +3,7 @@
 # You can modify this file to suit your needs.
 /.esphome/
 /secrets.yaml
+
+# Eye of Agamotto art: source image and generated layers stay local (repo is public).
+/art/source/
+/art/out/
