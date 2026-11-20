@@ -25,13 +25,16 @@
 # grey/tan/mauve/lilac/orange/red, no blues, Antonio font). Fixed - set_theme pushes are accepted
 # but ignored, since a colour-only palette can't draw the LCARS shapes.
 #
-# Pages (2026-11-06), picked from the LCARS footer bar along the bottom (ALERTS / AIR / SYSTEM):
+# Pages (2026-11-06), picked from the LCARS footer bar along the bottom (ALERTS / AIR / SYSTEM / INFRA):
 #   ALERTS  the notification cards + desk/lamp/GPU pill buttons (the home page)
 #   AIR     office readings from Home Assistant: CO2, PM2.5, radiation, temperature, humidity -
 #           each a value block coloured by health and an 8 h trend line (sampled here every 5 min,
 #           96 points - starts empty after a reboot)
 #   SYSTEM  Feather's LLM metrics (set_llm)
-# AIR and SYSTEM drop back to ALERTS after 60 s. The frame, header and footer live on LVGL's top
+#   INFRA   infrastructure - for now Alberta's power grid (set_infra, from Feather's power_grid
+#           watcher): status + pool price blocks, load / generation / capability / spare /
+#           reserve / interchange / ties, and a fuel-mix bar. Room for more systems later.
+# AIR, SYSTEM and INFRA drop back to ALERTS after 60 s. The frame, header and footer live on LVGL's top
 # layer so every page shares them; pages only draw inside x 16..318, y 22..210.
 # Health colours (muted LCARS, Feather's theme): green good, tan moderate, orange poor, red bad,
 # grey no data. Thresholds - CO2 800 / 1200 / 2000 ppm; PM2.5 12 / 35.5 / 55.5 ug/m3 (US AQI);
@@ -39,7 +42,7 @@
 # 19-24, moderate 17-26, poor 15-28 C; humidity good 40-60, moderate 30-65, poor 20-70 %.
 # The elbow + upper sidebar show the WORST of CO2 / PM2.5 / radiation on every page, with lilac
 # in place of green so a healthy room keeps the usual LCARS frame.
-# The footer's SYSTEM segment turns tan/red when the SYSTEM page needs a look; ALERTS shows "+N".
+# The footer's SYSTEM and INFRA segments turn tan/red when that page needs a look; ALERTS shows "+N".
 #
 # Backlight floor (2026-11-06): never below 25% outside quiet hours (Feather's set_status quiet
 # flag) AND outside 21:00-06:00 local - the clock guard keeps it dark at night if Feather is
@@ -149,6 +152,56 @@ api:
             id: llm_vram_bar
             value: !lambda return vram_pct;
         - script.execute: render_health
+
+    # The INFRA page, pre-formatted by Feather (feather/heimdall/power_grid.py cyd_snapshot).
+    # health: 0 normal, 1 tight, 2 Grid Alert. mix: MW for gas, wind, solar, hydro, other.
+    - action: set_infra
+      variables:
+        health: int
+        status: string
+        price: string
+        load: string
+        gen: string
+        cap: string
+        spare: string
+        reserve: string
+        imports: string
+        ties: string
+        mix: int[]
+        mix_text: string
+        updated: string
+      then:
+        - lambda: |-
+            id(infra_health) = health;
+            static const uint32_t cols[3] = {0x99cc99, 0xffcc66, 0xcc6666};   // green tan red
+            lv_obj_set_style_bg_color(id(infra_status_blk), lv_color_hex(cols[std::max(0, std::min(2, (int) health))]), LV_PART_MAIN);
+            lv_label_set_text(id(infra_status), status.c_str());
+            lv_label_set_text(id(infra_updated), updated.c_str());
+            lv_label_set_text(id(infra_price), price.c_str());
+            lv_label_set_text(id(infra_load), load.c_str());
+            lv_label_set_text(id(infra_gen), gen.c_str());
+            lv_label_set_text(id(infra_cap), cap.c_str());
+            lv_label_set_text(id(infra_spare), spare.c_str());
+            lv_label_set_text(id(infra_reserve), reserve.c_str());
+            lv_label_set_text(id(infra_imports), imports.c_str());
+            lv_label_set_text(id(infra_ties), ties.c_str());
+            lv_label_set_text(id(infra_mix_text), mix_text.c_str());
+            // Fuel-mix bar: segments sized by share of the 302 px track, in order.
+            lv_obj_t *segs[5] = {id(infra_mix0), id(infra_mix1), id(infra_mix2), id(infra_mix3), id(infra_mix4)};
+            long total = 0;
+            for (size_t i = 0; i < 5 && i < mix.size(); i++) total += std::max(0, (int) mix[i]);
+            int x = 0;
+            for (int i = 0; i < 5; i++) {
+              int v = i < (int) mix.size() ? std::max(0, (int) mix[i]) : 0;
+              int w = total > 0 ? (int) lroundf(302.0f * v / total) : 0;
+              if (i == 4 || x + w > 302) w = total > 0 && v > 0 ? 302 - x : 0;
+              lv_obj_set_x(segs[i], x);
+              lv_obj_set_width(segs[i], std::max(0, w));
+              if (w > 0) lv_obj_clear_flag(segs[i], LV_OBJ_FLAG_HIDDEN);
+              else lv_obj_add_flag(segs[i], LV_OBJ_FLAG_HIDDEN);
+              x += std::max(0, w);
+            }
+        - script.execute: render_footer
 
     # Feather's GPU mode (feather/modes.py): 2 lights the button, busy greys it out.
     - action: set_mode
@@ -309,7 +362,11 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
-  - id: current_page          # 0 ALERTS, 1 AIR, 2 SYSTEM
+  - id: infra_health          # 0 normal, 1 tight, 2 Grid Alert (set_infra)
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: current_page          # 0 ALERTS, 1 AIR, 2 SYSTEM, 3 INFRA
     type: int
     restore_value: no
     initial_value: "0"
@@ -687,7 +744,7 @@ script:
           }
       - script.execute: render_footer
 
-  # Paging from the footer: 0 ALERTS, 1 AIR, 2 SYSTEM. AIR/SYSTEM fall back to ALERTS after 60 s.
+  # Paging from the footer: 0 ALERTS, 1 AIR, 2 SYSTEM, 3 INFRA. The others fall back to ALERTS after 60 s.
   - id: goto_page
     parameters:
       page: int
@@ -706,7 +763,13 @@ script:
                 then:
                   - lvgl.page.show: llm_page
                 else:
-                  - lvgl.page.show: main_page
+                  - if:
+                      condition:
+                        lambda: return page == 3;
+                      then:
+                        - lvgl.page.show: infra_page
+                      else:
+                        - lvgl.page.show: main_page
       - script.execute: render_footer
       - if:
           condition:
@@ -722,22 +785,23 @@ script:
       - delay: 60s
       - script.execute: {id: goto_page, page: 0}
 
-  # Footer segments: the current page lit orange, others mauve - except SYSTEM, which shows the
-  # LLM health (tan / red) when it isn't the current page. ALERTS carries the "+N" overflow count.
+  # Footer segments: the current page lit orange, others mauve - except SYSTEM and INFRA, which show
+  # their page's health (tan / red) when they aren't the current page. ALERTS carries the "+N".
   # The header's title pill names the page.
   - id: render_footer
     then:
       - lambda: |-
-          lv_obj_t *segs[3] = {id(foot_alerts), id(foot_air), id(foot_system)};
+          lv_obj_t *segs[4] = {id(foot_alerts), id(foot_air), id(foot_system), id(foot_infra)};
           int pg = id(current_page);
-          for (int i = 0; i < 3; i++) {
+          for (int i = 0; i < 4; i++) {
             uint32_t col = (i == pg) ? 0xff9933 : 0xa366a3;
-            if (i == 2 && i != pg && id(llm_health) > 0) col = id(llm_health) >= 2 ? 0xcc6666 : 0xffcc66;
+            int h = i == 2 ? id(llm_health) : (i == 3 ? id(infra_health) : 0);
+            if (i != pg && h > 0) col = h >= 2 ? 0xcc6666 : 0xffcc66;
             lv_obj_set_style_bg_color(segs[i], lv_color_hex(col), LV_PART_MAIN);
           }
           std::string alerts = id(more_count) > 0 ? str_sprintf("ALERTS +%d", id(more_count)) : std::string("ALERTS");
           lv_label_set_text(id(foot_alerts_label), alerts.c_str());
-          static const char *titles[3] = {"ALERTS", "OFFICE AIR 8H", "SYSTEM"};
+          static const char *titles[4] = {"ALERTS", "OFFICE AIR 8H", "SYSTEM", "AB GRID"};
           lv_label_set_text(id(title_label), titles[pg]);
 
 # ============================================================
@@ -847,7 +911,7 @@ font:
     id: antonio_b22
     size: 22
     bpp: 4
-    glyphs: "0123456789.-"
+    glyphs: "0123456789.,-"
   - file: "gfonts://Antonio@400"
     id: antonio_15
     size: 15
@@ -857,7 +921,7 @@ font:
     id: antonio_13
     size: 13
     bpp: 4
-    glyphs: " +-:.,/%0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz()"
+    glyphs: " +-:.,/%$0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz()"
   - file:
       type: web
       url: https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/fonts/materialdesignicons-webfont.ttf
@@ -888,7 +952,7 @@ image:
 # LVGL layout - 320x240 landscape, LCARS.
 #   top layer (every page): header row 0..18 with the elbow (AQ colour), clock, UTC, status
 #     icons and the page title pill; left sidebar x 0..12 curving into the footer y 214..240
-#     (ALERTS / AIR / SYSTEM page buttons, then a tan end cap); the wake catcher above it all.
+#     (ALERTS / AIR / SYSTEM / INFRA page buttons, then a tan end cap); the wake catcher above it all.
 #   pages draw only inside x 16..318, y 22..210.
 # ============================================================
 lvgl:
@@ -1007,30 +1071,39 @@ lvgl:
           bg_color: 0xff9933
           x: 44
           y: 214
-          width: 70
+          width: 58
           height: 26
           widgets: [label: {id: foot_alerts_label, align: BOTTOM_RIGHT, x: -4, y: -2, text: "ALERTS", text_font: antonio_b14, text_color: 0x000000}]
           on_click: [script.execute: {id: goto_page, page: 0}]
       - button:
           id: foot_air
           styles: foot_btn_style
-          x: 118
+          x: 105
           y: 214
-          width: 70
+          width: 58
           height: 26
           widgets: [label: {align: BOTTOM_RIGHT, x: -4, y: -2, text: "AIR", text_font: antonio_b14, text_color: 0x000000}]
           on_click: [script.execute: {id: goto_page, page: 1}]
       - button:
           id: foot_system
           styles: foot_btn_style
-          x: 192
+          x: 166
           y: 214
-          width: 70
+          width: 58
           height: 26
           widgets: [label: {align: BOTTOM_RIGHT, x: -4, y: -2, text: "SYSTEM", text_font: antonio_b14, text_color: 0x000000}]
           on_click: [script.execute: {id: goto_page, page: 2}]
-      - obj: {styles: frame_style, x: 266, y: 214, width: 54, height: 26, radius: 13, bg_color: 0xffcc66, clickable: false}
-      - obj: {styles: frame_style, x: 266, y: 214, width: 20, height: 26, radius: 0, bg_color: 0xffcc66, clickable: false}
+      - button:
+          id: foot_infra
+          styles: foot_btn_style
+          x: 227
+          y: 214
+          width: 58
+          height: 26
+          widgets: [label: {align: BOTTOM_RIGHT, x: -4, y: -2, text: "INFRA", text_font: antonio_b14, text_color: 0x000000}]
+          on_click: [script.execute: {id: goto_page, page: 3}]
+      - obj: {styles: frame_style, x: 288, y: 214, width: 32, height: 26, radius: 13, bg_color: 0xffcc66, clickable: false}
+      - obj: {styles: frame_style, x: 288, y: 214, width: 16, height: 26, radius: 0, bg_color: 0xffcc66, clickable: false}
 
       # ---- invisible full-screen catcher, only shown while the screen is dark/dim (last = on top)
       - obj:
@@ -1407,3 +1480,66 @@ lvgl:
         - label: {id: llm_reuse, x: 124, y: 160, width: 190, text: "-", text_color: 0xffcc66}
         - label: {id: llm_turns_cap, x: 16, y: 182, text: "LAST TURN", text_color: 0x9c9ca6}
         - label: {id: llm_turns, x: 124, y: 182, width: 190, text: "-", text_color: 0xffcc66}
+
+    # ---- INFRA: Alberta's power grid (set_infra). Rows of caption + value, LCARS like SYSTEM.
+    - id: infra_page
+      bg_color: 0x000000
+      scrollable: false
+      widgets:
+        - obj:
+            id: infra_status_blk
+            styles: frame_style
+            x: 16
+            y: 22
+            width: 148
+            height: 36
+            radius: 8
+            bg_color: 0x9c9ca6
+            scrollable: false
+            widgets:
+              - label: {x: 6, y: 1, text: "ALBERTA GRID", text_font: antonio_b14, text_color: 0x000000}
+              - label: {id: infra_updated, x: 6, y: 18, text: "", text_font: antonio_13, text_color: 0x000000}
+              - label: {id: infra_status, align: RIGHT_MID, x: -6, y: 0, text: "NO DATA", text_font: antonio_b16, text_color: 0x000000}
+        - obj:
+            styles: frame_style
+            x: 168
+            y: 22
+            width: 150
+            height: 36
+            radius: 8
+            bg_color: 0xcc99cc
+            scrollable: false
+            widgets:
+              - label: {x: 6, y: 1, text: "POOL PRICE", text_font: antonio_b14, text_color: 0x000000}
+              - label: {x: 6, y: 18, text: "$/MWh LAST HR", text_font: antonio_13, text_color: 0x000000}
+              - label: {id: infra_price, align: RIGHT_MID, x: -6, y: 0, text: "--", text_font: antonio_b22, text_color: 0x000000}
+        - label: {x: 16, y: 62, text: "LOAD", text_color: 0x9c9ca6}
+        - label: {id: infra_load, x: 148, y: 62, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 79, text: "NET GENERATION", text_color: 0x9c9ca6}
+        - label: {id: infra_gen, x: 148, y: 79, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 96, text: "MAX CAPABILITY", text_color: 0x9c9ca6}
+        - label: {id: infra_cap, x: 148, y: 96, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 113, text: "SPARE (GAS/HYDRO)", text_color: 0x9c9ca6}
+        - label: {id: infra_spare, x: 148, y: 113, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 130, text: "RESERVE", text_color: 0x9c9ca6}
+        - label: {id: infra_reserve, x: 148, y: 130, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 147, text: "INTERCHANGE", text_color: 0x9c9ca6}
+        - label: {id: infra_imports, x: 148, y: 147, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - label: {x: 16, y: 164, text: "TIES (+ = IN)", text_color: 0x9c9ca6}
+        - label: {id: infra_ties, x: 148, y: 164, width: 170, long_mode: DOT, text: "-", text_color: 0xffcc66}
+        - obj:
+            styles: frame_style
+            x: 16
+            y: 183
+            width: 302
+            height: 8
+            radius: 0
+            bg_color: 0x1c1c20
+            scrollable: false
+            widgets:
+              - obj: {id: infra_mix0, styles: frame_style, x: 0, y: 0, width: 0, height: 8, radius: 0, bg_color: 0xff9933, hidden: true, clickable: false}
+              - obj: {id: infra_mix1, styles: frame_style, x: 0, y: 0, width: 0, height: 8, radius: 0, bg_color: 0xcc99cc, hidden: true, clickable: false}
+              - obj: {id: infra_mix2, styles: frame_style, x: 0, y: 0, width: 0, height: 8, radius: 0, bg_color: 0xffcc66, hidden: true, clickable: false}
+              - obj: {id: infra_mix3, styles: frame_style, x: 0, y: 0, width: 0, height: 8, radius: 0, bg_color: 0xa366a3, hidden: true, clickable: false}
+              - obj: {id: infra_mix4, styles: frame_style, x: 0, y: 0, width: 0, height: 8, radius: 0, bg_color: 0x9c9ca6, hidden: true, clickable: false}
+        - label: {id: infra_mix_text, x: 16, y: 194, width: 302, long_mode: CLIP, recolor: true, text: "", text_font: antonio_13, text_color: 0x9c9ca6}
